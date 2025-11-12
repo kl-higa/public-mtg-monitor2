@@ -161,11 +161,22 @@ function getSources_() {
  * 毎日実行される本番処理（トリガー設定必要）
  */
 function dailyCheckAll() {
+  const startTime = new Date();
   const state = loadState_();
   const sources = getSources_();
   
+  // 実行結果サマリー
+  const summary = {
+    total: sources.length,
+    newMeetings: [],      // 新着があった会議
+    noUpdates: [],        // 新着なし
+    errors: [],           // エラーがあった会議
+    firstRun: []          // 初回シード
+  };
+  
   if (!sources.length) {
     Logger.log('⚠️ No active sources found');
+    sendDailyCheckReport_(summary, startTime, new Date());
     return;
   }
   
@@ -174,7 +185,12 @@ function dailyCheckAll() {
     const html = fetchText_(src.indexUrl);
     
     if (!html) { 
-      Logger.log(`skip (fetch failed): [${src.id}] [${src.agency}] ${src.name}`); 
+      Logger.log(`skip (fetch failed): [${src.id}] [${src.agency}] ${src.name}`);
+      summary.errors.push({
+        id: src.id,
+        name: src.name,
+        reason: 'ページ取得失敗'
+      });
       continue; 
     }
 
@@ -190,20 +206,49 @@ function dailyCheckAll() {
 
     // 会議ページ一覧抽出
     const pages = extractMeetingPages_(html, baseDir);
-    if (!pages.length) continue;
+    if (!pages.length) {
+      summary.errors.push({
+        id: src.id,
+        name: src.name,
+        reason: '会議ページが見つからない'
+      });
+      continue;
+    }
 
     // 初回シード
     if (!state[src.indexUrl].lastId) {
+      // 初回は最新ページをスクレイピングして日付取得
+      const firstMt = scrapeMeetingPage_(pages[0].url);
+      const firstDate = firstMt ? (firstMt.date || '日付不明') : '日付不明';
+      
       state[src.indexUrl].lastId = pages[0].id;
       state[src.indexUrl].lastUrl = pages[0].url;
+      state[src.indexUrl].lastMeetingDate = firstDate;  // ← 追加
       state[src.indexUrl].pendingSummary = null;
-      Logger.log(`first-run seed: [${src.id}] [${src.agency}] ${src.name} -> ${pages[0].id} ${pages[0].url}`);
+      Logger.log(`first-run seed: [${src.id}] [${src.agency}] ${src.name} -> ${pages[0].id} ${pages[0].url} (${firstDate})`);
       saveState_(state);
+      
+      summary.firstRun.push({
+        id: src.id,
+        name: src.name,
+        meetingId: pages[0].id,
+        meetingDate: firstDate  // ← レポート用
+      });
       continue;
     }
 
     const lastId = state[src.indexUrl].lastId;
     const newcomers = pages.filter(p => p.id > lastId).sort((a, b) => a.id - b.id);
+
+    // 新着がない場合
+    if (newcomers.length === 0) {
+      summary.noUpdates.push({
+        id: src.id,
+        name: src.name,
+        lastMeetingId: lastId,
+        lastMeetingDate: state[src.indexUrl].lastMeetingDate || '日付不明'  // ← stateから取得
+      });
+    }
 
     // 新着処理
     for (const p of newcomers) {
@@ -255,6 +300,7 @@ function dailyCheckAll() {
         Logger.log('no recipients for ' + src.name);
       }
 
+      let sentCount = 0;
       recObjs.forEach(r => {
         const unsubUrl = `${CONFIG.APP.BASE_WEBAPP_URL}?action=unsubscribe&token=${encodeURIComponent(r.token)}&email=${encodeURIComponent(r.email)}&source=${encodeURIComponent(src.name)}`;
         const resubUrl = `${CONFIG.APP.BASE_WEBAPP_URL}?action=resub&token=${encodeURIComponent(r.token)}&email=${encodeURIComponent(r.email)}&source=${encodeURIComponent(src.name)}`;
@@ -273,6 +319,7 @@ function dailyCheckAll() {
 
         if (!shouldSkipDuplicateV2_(mt.pageUrl, r.email)) {
           sendToRecipients_([r.email], subject, plainPerUser, htmlPerUser);
+          sentCount++;
         } else {
           Logger.log('skip duplicate mail (new): ' + mt.pageUrl + ' -> ' + r.email);
         }
@@ -301,12 +348,115 @@ function dailyCheckAll() {
       state[src.indexUrl].lastId = p.id;
       state[src.indexUrl].lastUrl = p.url;
       state[src.indexUrl].lastSent = new Date().toISOString();
+      state[src.indexUrl].lastMeetingDate = mt.date || '日付不明';  // ← 追加
       state[src.indexUrl].pendingSummary = null;
       saveState_(state);
+      
+      // サマリーに記録
+      summary.newMeetings.push({
+        id: src.id,
+        name: src.name,
+        meetingId: p.id,
+        title: mt.title,
+        url: p.url,
+        sentCount: sentCount
+      });
     }
   }
   
   Logger.log('✅ dailyCheckAll完了');
+  
+  // 実行結果レポート送信
+  const endTime = new Date();
+  sendDailyCheckReport_(summary, startTime, endTime);
+}
+
+/**
+ * dailyCheckAllの実行結果レポートを管理者に送信
+ */
+function sendDailyCheckReport_(summary, startTime, endTime) {
+  const duration = Math.round((endTime - startTime) / 1000);
+  const hasNewMeetings = summary.newMeetings.length > 0;
+  const hasErrors = summary.errors.length > 0;
+  
+  // 件名
+  let subject = '[政府会議ウォッチャー] ';
+  if (hasNewMeetings) {
+    subject += `✨ 新着 ${summary.newMeetings.length}件`;
+  } else if (hasErrors) {
+    subject += '⚠️ エラーあり';
+  } else {
+    subject += '✅ 新着なし';
+  }
+  
+  // 本文
+  let body = `
+政府会議ウォッチャー 実行レポート
+
+━━━━━━━━━━━━━━━━━━
+■実行時刻
+${startTime.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' })}
+
+■実行時間
+${duration}秒
+
+■監視対象
+全${summary.total}会議
+
+━━━━━━━━━━━━━━━━━━
+`;
+
+  // 新着会議
+  if (summary.newMeetings.length > 0) {
+    body += `\n✨ 新着会議（${summary.newMeetings.length}件）\n`;
+    summary.newMeetings.forEach(m => {
+      body += `\n[${m.id}] ${m.name}`;
+      body += `\n  第${m.meetingId}回: ${m.title}`;
+      body += `\n  ${m.url}`;
+      body += `\n  配信: ${m.sentCount}名`;
+    });
+    body += '\n';
+  }
+
+  // 新着なし
+  if (summary.noUpdates.length > 0) {
+    body += `\n✅ 新着なし（${summary.noUpdates.length}件）\n`;
+    summary.noUpdates.forEach(m => {
+      const dateStr = m.lastMeetingDate ? ` ${m.lastMeetingDate}` : '';  // ← 修正箇所
+      body += `  [${m.id}] ${m.name} (最終: 第${m.lastMeetingId}回${dateStr})\n`;
+    });
+  }
+
+  // 初回シード
+  if (summary.firstRun.length > 0) {
+    body += `\n🌱 初回シード（${summary.firstRun.length}件）\n`;
+    summary.firstRun.forEach(m => {
+      body += `  [${m.id}] ${m.name} (第${m.meetingId}回)\n`;
+    });
+  }
+
+  // エラー
+  if (summary.errors.length > 0) {
+    body += `\n⚠️ エラー（${summary.errors.length}件）\n`;
+    summary.errors.forEach(e => {
+      body += `  [${e.id}] ${e.name}: ${e.reason}\n`;
+    });
+  }
+
+  body += `\n━━━━━━━━━━━━━━━━━━
+GASログ: https://script.google.com/home
+  `;
+
+  try {
+    GmailApp.sendEmail(
+      'toshihiro.higaki@klammer.co.jp',
+      subject,
+      body
+    );
+    Logger.log('✅ 実行レポート送信完了');
+  } catch (e) {
+    Logger.log('❌ レポート送信失敗: ' + e.message);
+  }
 }
 
 /**
@@ -442,19 +592,48 @@ function scrapeMeetingPage_(url) {
   const titleMatch = html.match(/<title[^>]*?>(.*?)<\/title>/i);
   if (titleMatch) mt.title = titleMatch[1].replace(/<[^>]+>/g, '').trim();
 
+  // ← 日付抽出（修正版）
+  // パターン1: <p>YYYY年M月D日</p>（最終更新日を除外）
+  const datePattern = /<p>(\d{4})年(\d{1,2})月(\d{1,2})日<\/p>/g;
+  let match;
+  
+  while ((match = datePattern.exec(html)) !== null) {
+    // マッチした部分の前後100文字を取得
+    const startPos = Math.max(0, match.index - 100);
+    const context = html.substring(startPos, match.index + match[0].length + 100);
+    
+    // 「最終更新日」「更新日」が含まれていない場合のみ採用
+    if (!context.includes('最終更新日') && !context.includes('更新日')) {
+      mt.date = `${match[1]}年${match[2]}月${match[3]}日`;
+      break;  // 最初に見つかった開催日を使用
+    }
+  }
+  
+  // パターン2: 令和表記（フォールバック）
+  if (!mt.date) {
+    const reiwaMatch = html.match(/令和(\d+)年(\d{1,2})月(\d{1,2})日/);
+    if (reiwaMatch) {
+      const reiwaYear = parseInt(reiwaMatch[1]);
+      const seirekiYear = 2018 + reiwaYear;
+      mt.date = `${seirekiYear}年${reiwaMatch[2]}月${reiwaMatch[3]}日`;
+    }
+  }
+
+  // YouTubeリンク取得
   const youtubePatterns = [
     /https?:\/\/(?:www\.)?(?:youtube\.com\/(?:watch\?v=|live\/)|youtu\.be\/)[\w\-]+/gi,
     /youtube\.com\/(?:watch\?v=|live\/)([\w\-]+)/gi
   ];
   
   for (const pattern of youtubePatterns) {
-    const match = html.match(pattern);
-    if (match) {
-      mt.youtube = match[0];
+    const youtubeMatch = html.match(pattern);
+    if (youtubeMatch) {
+      mt.youtube = youtubeMatch[0];
       break;
     }
   }
 
+  // PDF抽出
   const pdfPattern = /<a\s+href="([^"]+\.pdf)"[^>]*?>(.*?)<\/a>/gi;
   const baseDir = toDir_(url);
   let pdfMatch;
@@ -1725,69 +1904,148 @@ function regenerateAllTokens() {
   Logger.log('✅ 全トークン再生成完了');
 }
 
-// GASに実装
-function rotateTokens() {
-  // 1週間に1回トークンを更新
-  // 古いトークンは24時間の猶予期間後に無効化
-}
-
-
-
-
-/*  デバッグ用 */
-// ===== パターン2: 特定のID（1つ） =====
-function testSend2() {
-  sendLatestMeetingTest(2);  // ID=3の会議のみ
-}
-
-// GASで実行
-function testRateLimiting() {
-  Logger.log('=== Rate Limiting テスト ===\n');
+function backfillMeetingDates() {
+  Logger.log('=== 既存会議の日付をバックフィル ===\n');
   
-  const testEmail = 'test@example.com';
-  const testAction = 'unsubscribe';
+  const state = loadState_();
+  const sources = getSources_();
+  let updated = 0;
   
-  // 11回連続でチェック（10回が制限）
-  for (let i = 1; i <= 11; i++) {
-    const allowed = checkRateLimit_(testEmail, testAction);
-    Logger.log(`${i}回目: ${allowed ? '✅ 許可' : '❌ 制限'}`);
+  for (const src of sources) {
+    const srcState = state[src.indexUrl];
+    
+    // 既に日付がある場合はスキップ
+    if (srcState && srcState.lastMeetingDate) {
+      Logger.log(`✅ [${src.id}] ${src.name}: 日付あり (${srcState.lastMeetingDate})`);
+      continue;
+    }
+    
+    // 日付がない場合は取得
+    if (srcState && srcState.lastUrl) {
+      Logger.log(`🔄 [${src.id}] ${src.name}: 日付取得中...`);
+      
+      const mt = scrapeMeetingPage_(srcState.lastUrl);
+      const date = mt && mt.date ? mt.date : '日付不明';
+      
+      state[src.indexUrl].lastMeetingDate = date;
+      Logger.log(`   → ${date}`);
+      updated++;
+      
+      Utilities.sleep(2000);  // 2秒待機（VPS負荷軽減）
+    }
   }
   
-  Logger.log('\n=== テスト完了 ===');
-  Logger.log('10回目まで許可、11回目で制限されればOK');
+  if (updated > 0) {
+    saveState_(state);
+    Logger.log(`\n✅ ${updated}件の日付を追加しました`);
+  } else {
+    Logger.log('\n✅ 全ての会議に日付情報があります');
+  }
 }
 
-// GASで実行
-function testSecurityLogging() {
-  Logger.log('=== セキュリティログ テスト ===\n');
+/**
+ * stateの内容を確認
+ */
+function checkState() {
+  const state = loadState_();
+  const sources = getSources_();
   
-  // 正常なログ
-  logSecurityEvent_('test_action', 'test@example.com', 'success');
-  Logger.log('✅ 正常ログ記録完了');
+  Logger.log('=== State確認 ===\n');
   
-  // 異常なログ（アラートが飛ぶ）
-  logSecurityEvent_('test_action', 'test@example.com', 'rate_limit_exceeded', { count: 15 });
-  Logger.log('⚠️ 異常ログ記録完了（管理者にメール送信される）');
-  
-  Logger.log('\n=== テスト完了 ===');
-  Logger.log('メールボックスをチェックしてください');
+  sources.forEach(src => {
+    const srcState = state[src.indexUrl];
+    Logger.log(`[${src.id}] ${src.name}`);
+    
+    if (srcState) {
+      Logger.log(`  lastId: ${srcState.lastId}`);
+      Logger.log(`  lastMeetingDate: ${srcState.lastMeetingDate || '❌ なし'}`);
+      Logger.log(`  lastUrl: ${srcState.lastUrl}`);
+    } else {
+      Logger.log(`  ❌ stateなし`);
+    }
+    Logger.log('');
+  });
 }
 
-// GASで実行
-function testCounters() {
-  Logger.log('=== カウンター テスト ===\n');
+/**
+ * 実際のHTMLから日付部分を探す
+ */
+function debugDateInHtml() {
+  const url = 'https://www.meti.go.jp/shingikai/energy_environment/doji_shijo_kento/020.html';
   
-  // カウンターを増やす
-  incrementRequestCounter_(true);   // 成功
-  incrementRequestCounter_(true);   // 成功
-  incrementRequestCounter_(false);  // 失敗
-  incrementGeminiCounter_();        // Gemini使用
-  incrementGeminiCounter_();        // Gemini使用
-  incrementRateLimitCounter_();     // Rate limit違反
+  Logger.log('=== HTML内の日付を探す ===');
+  Logger.log('URL: ' + url);
+  Logger.log('');
   
-  Logger.log('カウンターを更新しました');
-  Logger.log('\n次にダッシュボードを表示:');
+  const html = fetchText_(url);
   
-  // ダッシュボードで確認
-  showSecurityDashboard();
+  if (!html) {
+    Logger.log('❌ HTML取得失敗');
+    return;
+  }
+  
+  Logger.log('✅ HTML取得成功: ' + html.length + '文字');
+  Logger.log('');
+  
+  // HTMLの最初の2000文字を表示（日付が含まれていることが多い）
+  Logger.log('=== HTML冒頭 ===');
+  Logger.log(html.substring(0, 2000));
+  Logger.log('');
+  
+  // 「年」「月」「日」を含む行を抽出
+  Logger.log('=== 「年月日」を含む部分 ===');
+  const lines = html.split('\n');
+  let count = 0;
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (line.includes('年') && line.includes('月') && line.includes('日')) {
+      Logger.log(`[${i}] ${line.trim()}`);
+      count++;
+      if (count >= 10) break;  // 最初の10件のみ
+    }
+  }
+  
+  if (count === 0) {
+    Logger.log('❌ 「年月日」を含む行が見つかりません');
+  }
+  
+  Logger.log('');
+  Logger.log('=== タイトルタグ ===');
+  const titleMatch = html.match(/<title[^>]*?>(.*?)<\/title>/i);
+  if (titleMatch) {
+    Logger.log(titleMatch[1]);
+  }
+}
+
+function testDateExtraction() {
+  const url = 'https://www.meti.go.jp/shingikai/energy_environment/doji_shijo_kento/020.html';
+  
+  Logger.log('=== 日付抽出テスト ===');
+  Logger.log('URL: ' + url);
+  
+  const mt = scrapeMeetingPage_(url);
+  
+  if (mt) {
+    Logger.log('タイトル: ' + mt.title);
+    Logger.log('日付: ' + (mt.date || '❌ 取得失敗'));
+    Logger.log('YouTube: ' + (mt.youtube || 'なし'));
+    Logger.log('PDF数: ' + mt.pdfs.length);
+  } else {
+    Logger.log('❌ ページ取得失敗');
+  }
+}
+
+function clearMeetingDates() {
+  const state = loadState_();
+  const sources = getSources_();
+  
+  for (const src of sources) {
+    if (state[src.indexUrl]) {
+      delete state[src.indexUrl].lastMeetingDate;
+    }
+  }
+  
+  saveState_(state);
+  Logger.log('✅ 全ての日付情報をクリアしました');
 }
