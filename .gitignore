@@ -1,30 +1,60 @@
-# バックアップフォルダ
-_bk/
+# Google Apps Script
+.clasp.json
+.claspignore
 
-# OS関連
+# Credentials
+*.key
+*.pem
+*_credentials.json
+secrets.json
+
+# Environment variables
+.env
+.env.local
+
+# Node modules
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# macOS
 .DS_Store
-Thumbs.db
-desktop.ini
+.AppleDouble
+.LSOverride
 
-# エディタ関連
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# IDE
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
 
-# ログファイル
+# Logs
+logs/
 *.log
 
-# 一時ファイル
+# Temporary files
+tmp/
+temp/
 *.tmp
-*.temp
 
-# 環境変数・機密情報
-.env
-.env.local
-config.local.js
+# Archives
+*.zip
+*.tar.gz
+*.rar
 
-# node_modules（もし使用している場合）
-node_modules/
+# Backup files
+*.bak
+*.backup
+*_backup.gs
+
+# Test files (optional - 削除するかdebug/に移動)
+test_*.js
+*_test.js
+check_tokens.js
 
