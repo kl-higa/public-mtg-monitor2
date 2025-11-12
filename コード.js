@@ -204,8 +204,17 @@ function dailyCheckAll() {
       notifyUnregisteredCommittees_(src.name, unregistered);
     }
 
-    // 会議ページ一覧抽出
-    const pages = extractMeetingPages_(html, baseDir);
+    // 会議ページ一覧抽出（省庁によって方法を変える）
+    let pages = [];
+    if (src.agency === '経済産業省' || src.agency === '資源エネルギー庁') {
+      pages = extractMeetingPages_(html, baseDir);
+    } else if (src.agency === '金融庁') {
+      pages = extractFsaMeetingPages_(html, baseDir);
+    } else {
+      Logger.log(`⚠️ 未対応の省庁: ${src.agency}`);
+      continue;
+    }
+
     if (!pages.length) {
       summary.errors.push({
         id: src.id,
@@ -540,6 +549,39 @@ function extractMeetingPages_(html, baseDir) {
   return pages.sort((a, b) => b.id - a.id);
 }
 
+/**
+ * 金融庁の会議ページ一覧を抽出（YYYYMMDD形式）
+ */
+function extractFsaMeetingPages_(html, baseDir) {
+  const pages = [];
+  
+  // 金融庁は複数のディレクトリパターンがある
+  // siryou/, shiryou/, gijishidai/
+  const patterns = [
+    /href="([^"]*\/siryou\/(\d{8})\.html)"/gi,
+    /href="([^"]*\/shiryou\/(\d{8})\.html)"/gi,
+    /href="([^"]*\/gijishidai\/(\d{8})\.html)"/gi
+  ];
+  
+  for (const pattern of patterns) {
+    pattern.lastIndex = 0;  // 正規表現をリセット
+    let m;
+    
+    while ((m = pattern.exec(html)) !== null) {
+      const relPath = m[1];
+      const dateStr = m[2];  // YYYYMMDD
+      const id = parseInt(dateStr);  // 数値化して比較
+      const url = absoluteUrl_(baseDir, relPath);
+      
+      if (id && !pages.some(p => p.id === id)) {
+        pages.push({ id, url });
+      }
+    }
+  }
+  
+  return pages.sort((a, b) => b.id - a.id);
+}
+
 function detectRelatedCommittees_(indexUrl, html, baseDir) {
   const relatedCommittees = [];
   const pattern = /<a\s+href="([^"]+\/index\.html)"[^>]*?>(.*?)<\/a>/gi;
@@ -647,6 +689,97 @@ function scrapeMeetingPage_(url) {
     const isRoster = /委員名簿|名簿/.test(linkText);
     
     const refMatch = linkText.match(/(?:資料|参考資料|別添|別紙|参考|議事録)[\s　]*(\d+)/);
+    let refType = '';
+    let refNo = null;
+    
+    if (linkText.includes('資料') && !linkText.includes('参考資料')) {
+      refType = '資料';
+      if (refMatch) refNo = parseInt(refMatch[1]);
+    } else if (linkText.includes('参考資料')) {
+      refType = '参考資料';
+      if (refMatch) refNo = parseInt(refMatch[1]);
+    }
+    
+    mt.pdfs.push({ url: pdfUrl, title: linkText, isAgenda, isRoster, refType, refNo });
+  }
+
+  return mt;
+}
+
+/**
+ * 金融庁の会議ページをスクレイピング
+ */
+function scrapeFsaMeetingPage_(url) {
+  const html = fetchText_(url);
+  if (!html) return null;
+
+  const mt = {
+    title: '',
+    date: '',
+    format: '',
+    roster: '',
+    youtube: '',
+    pdfs: [],
+    pageUrl: url
+  };
+
+  // タイトル
+  const titleMatch = html.match(/<title[^>]*?>(.*?)<\/title>/i);
+  if (titleMatch) mt.title = titleMatch[1].replace(/<[^>]+>/g, '').trim();
+
+  // 日付抽出（全角・半角両対応）
+  const reiwaLiMatch = html.match(/<li[^>]*?>日時[：:]\s*令和([0-9０-９]+)年([0-9０-９]+)月([0-9０-９]+)日/i);
+  if (reiwaLiMatch) {
+    const reiwaYear = normalizeNum_(reiwaLiMatch[1]);
+    const month = normalizeNum_(reiwaLiMatch[2]);
+    const day = normalizeNum_(reiwaLiMatch[3]);
+    const seirekiYear = 2018 + reiwaYear;
+    mt.date = `${seirekiYear}年${month}月${day}日`;
+  }
+  
+  // フォールバック: URLから抽出
+  if (!mt.date) {
+    const urlDateMatch = url.match(/(\d{8})\.html$/);
+    if (urlDateMatch) {
+      const dateStr = urlDateMatch[1];
+      const year = dateStr.substring(0, 4);
+      const month = parseInt(dateStr.substring(4, 6));
+      const day = parseInt(dateStr.substring(6, 8));
+      mt.date = `${year}年${month}月${day}日`;
+    }
+  }
+
+  // YouTube個別動画リンク
+  const youtubePatterns = [
+    /https?:\/\/(?:www\.)?youtube\.com\/watch\?v=[\w\-]+/gi,
+    /https?:\/\/(?:www\.)?youtube\.com\/live\/[\w\-]+/gi,
+    /https?:\/\/youtu\.be\/[\w\-]+/gi
+  ];
+  
+  for (const pattern of youtubePatterns) {
+    const match = html.match(pattern);
+    if (match) {
+      if (!match[0].includes('/channel/')) {
+        mt.youtube = match[0];
+        break;
+      }
+    }
+  }
+
+  // PDF取得
+  const pdfPattern = /<a[^>]+href="([^"]+\.pdf)"[^>]*?>(.*?)<\/a>/gi;
+  const baseDir = toDir_(url);
+  let pdfMatch;
+  
+  while ((pdfMatch = pdfPattern.exec(html)) !== null) {
+    const pdfPath = pdfMatch[1];
+    const linkText = pdfMatch[2].replace(/<[^>]+>/g, '').trim();
+    const pdfUrl = absoluteUrl_(baseDir, pdfPath);
+    
+    const isAgenda = /議事次第|次第/.test(linkText);
+    const isRoster = /委員名簿|名簿/.test(linkText);
+    
+    const refMatch = linkText.match(/(?:資料|参考資料|別添|別紙|参考)[\s　]*(\d+)/);
     let refType = '';
     let refNo = null;
     
@@ -1201,7 +1334,9 @@ function buildMailWithSummary_(meeting, finalSummaryText, linksBlock, sourceTagO
 
   const fallbackNote = REPORT
     ? '※本メールは「資料公開（取りまとめ等）」の検知です。会議開催・動画配信は確認できないため、文字起こし・要約は行いません。PDF本文をご確認ください。'
-    : '';
+    : (!mt.youtube && meeting.pageUrl.includes('fsa.go.jp')
+        ? '※金融庁会議です。YouTube動画がないため資料公開の通知のみとなります。議事要旨公開後（1-2ヶ月後）に要約を配信予定です。'
+        : '');
     
   const fallbackPlain = `■${meeting.title}
 ────────────────────────────
@@ -1943,109 +2078,856 @@ function backfillMeetingDates() {
   }
 }
 
+
+
+
+
+
 /**
- * stateの内容を確認
+ * 金融庁の複数サイトを一括分析
  */
-function checkState() {
-  const state = loadState_();
-  const sources = getSources_();
+function analyzeFsaSites() {
+  const sites = [
+    {
+      name: 'AI官民フォーラム',
+      indexUrl: 'https://www.fsa.go.jp/singi/ai_forum/index.html',
+      sampleShiryoUrl: 'https://www.fsa.go.jp/singi/ai_forum/siryou/20250912.html',
+      sampleGijiyoshiUrl: 'https://www.fsa.go.jp/singi/ai_forum/gijiyoshi/20251024.html'
+    },
+    {
+      name: '地域金融力創造WG',
+      indexUrl: 'https://www.fsa.go.jp/singi/singi_kinyu/chiikikinyuryoku_wg/chiikikinyuryoku_wg.html',
+      sampleShiryoUrl: null,  // 後で見つける
+      sampleGijiyoshiUrl: null
+    },
+    {
+      name: 'サステナビリティ開示WG',
+      indexUrl: 'https://www.fsa.go.jp/singi/singi_kinyu/sustainability_disclose_wg/sustainability_disclose_wg_index.html',
+      sampleShiryoUrl: null,
+      sampleGijiyoshiUrl: null
+    },
+    {
+      name: '暗号資産制度WG',
+      indexUrl: 'https://www.fsa.go.jp/singi/singi_kinyu/angoshisanseido_wg/angoshisanseido_wg_index.html',
+      sampleShiryoUrl: null,
+      sampleGijiyoshiUrl: null
+    }
+  ];
   
-  Logger.log('=== State確認 ===\n');
-  
-  sources.forEach(src => {
-    const srcState = state[src.indexUrl];
-    Logger.log(`[${src.id}] ${src.name}`);
+  sites.forEach((site, idx) => {
+    Logger.log(`\n\n${'='.repeat(80)}`);
+    Logger.log(`[${idx + 1}/${sites.length}] ${site.name}`);
+    Logger.log('='.repeat(80));
     
-    if (srcState) {
-      Logger.log(`  lastId: ${srcState.lastId}`);
-      Logger.log(`  lastMeetingDate: ${srcState.lastMeetingDate || '❌ なし'}`);
-      Logger.log(`  lastUrl: ${srcState.lastUrl}`);
+    analyzeSingleSite_(site);
+    
+    Utilities.sleep(3000);  // 3秒待機
+  });
+  
+  Logger.log('\n\n' + '='.repeat(80));
+  Logger.log('✅ 全サイト分析完了');
+  Logger.log('='.repeat(80));
+}
+
+/**
+ * 単一サイトの分析
+ */
+function analyzeSingleSite_(site) {
+  Logger.log(`\n📋 インデックスページ: ${site.indexUrl}`);
+  
+  const html = fetchText_(site.indexUrl);
+  
+  if (!html) {
+    Logger.log('❌ ページ取得失敗');
+    return;
+  }
+  
+  Logger.log(`✅ 取得成功: ${html.length}文字`);
+  
+  // 1. タイトル
+  const titleMatch = html.match(/<title[^>]*?>(.*?)<\/title>/i);
+  if (titleMatch) {
+    Logger.log(`\n■タイトル\n${titleMatch[1].trim()}`);
+  }
+  
+  // 2. 会議リンクのパターン検出
+  Logger.log('\n■会議ページのリンクパターン');
+  
+  // パターンA: siryou/YYYYMMDD.html
+  const shiryoLinks = html.match(/href="([^"]*siryou\/\d+\.html)"/gi);
+  if (shiryoLinks) {
+    Logger.log(`\n📄 資料ページ形式: ${shiryoLinks.length}件`);
+    shiryoLinks.slice(0, 3).forEach(link => {
+      const url = link.match(/href="([^"]+)"/)[1];
+      Logger.log(`  ${url}`);
+    });
+  }
+  
+  // パターンB: gijiyoshi/YYYYMMDD.html
+  const gijiyoshiLinks = html.match(/href="([^"]*gijiyoshi\/\d+\.html)"/gi);
+  if (gijiyoshiLinks) {
+    Logger.log(`\n📝 議事要旨形式: ${gijiyoshiLinks.length}件`);
+    gijiyoshiLinks.slice(0, 3).forEach(link => {
+      const url = link.match(/href="([^"]+)"/)[1];
+      Logger.log(`  ${url}`);
+    });
+  }
+  
+  // パターンC: 番号付きリンク（001.html, 002.htmlなど）
+  const numberedLinks = html.match(/href="([^"]*\/\d{3,4}\.html)"/gi);
+  if (numberedLinks) {
+    Logger.log(`\n🔢 番号形式: ${numberedLinks.length}件`);
+    numberedLinks.slice(0, 3).forEach(link => {
+      const url = link.match(/href="([^"]+)"/)[1];
+      Logger.log(`  ${url}`);
+    });
+  }
+  
+  // パターンD: その他のリンクパターン
+  const allLinks = html.match(/href="([^"]*\.html)"/gi);
+  if (allLinks) {
+    Logger.log(`\n🔗 全HTMLリンク: ${allLinks.length}件`);
+    
+    // ユニークなパターンを抽出
+    const patterns = new Set();
+    allLinks.forEach(link => {
+      const url = link.match(/href="([^"]+)"/)[1];
+      // パスの構造を抽出（ディレクトリ名とファイル名パターン）
+      const pattern = url.replace(/\d+/g, 'N').replace(/\.html.*/, '.html');
+      patterns.add(pattern);
+    });
+    
+    Logger.log('  検出されたパターン:');
+    Array.from(patterns).slice(0, 10).forEach(p => Logger.log(`    ${p}`));
+  }
+  
+  // 3. 日付表記の検出
+  Logger.log('\n■日付表記パターン');
+  
+  // 令和表記
+  const reiwaMatches = html.match(/令和\d+年\d+月\d+日/g);
+  if (reiwaMatches) {
+    Logger.log(`  令和表記: ${reiwaMatches.length}件`);
+    Logger.log(`    例: ${reiwaMatches[0]}`);
+  }
+  
+  // 西暦表記
+  const seirekiMatches = html.match(/\d{4}年\d+月\d+日/g);
+  if (seirekiMatches) {
+    Logger.log(`  西暦表記: ${seirekiMatches.length}件`);
+    Logger.log(`    例: ${seirekiMatches[0]}`);
+  }
+  
+  // YYYY/MM/DD形式
+  const slashMatches = html.match(/\d{4}\/\d{1,2}\/\d{1,2}/g);
+  if (slashMatches) {
+    Logger.log(`  スラッシュ形式: ${slashMatches.length}件`);
+    Logger.log(`    例: ${slashMatches[0]}`);
+  }
+  
+  // 4. サンプルページを分析（最初の資料ページ）
+  if (shiryoLinks && shiryoLinks.length > 0) {
+    const firstShiryoUrl = shiryoLinks[0].match(/href="([^"]+)"/)[1];
+    const fullUrl = firstShiryoUrl.startsWith('http') 
+      ? firstShiryoUrl 
+      : `https://www.fsa.go.jp${firstShiryoUrl.startsWith('/') ? '' : '/singi/'}${firstShiryoUrl}`;
+    
+    Logger.log(`\n\n■サンプル資料ページ分析\n${fullUrl}`);
+    analyzeSamplePage_(fullUrl);
+  }
+}
+
+/**
+ * サンプルページの詳細分析
+ */
+function analyzeSamplePage_(url) {
+  const html = fetchText_(url);
+  
+  if (!html) {
+    Logger.log('❌ ページ取得失敗');
+    return;
+  }
+  
+  Logger.log(`✅ 取得成功: ${html.length}文字`);
+  
+  // タイトル
+  const titleMatch = html.match(/<title[^>]*?>(.*?)<\/title>/i);
+  if (titleMatch) {
+    Logger.log(`タイトル: ${titleMatch[1].trim()}`);
+  }
+  
+  // 日付
+  const dateMatches = html.match(/\d{4}年\d+月\d+日/g);
+  if (dateMatches) {
+    Logger.log(`日付候補: ${dateMatches[0]}`);
+  }
+  
+  // YouTube
+  const ytMatches = html.match(/https?:\/\/(?:www\.)?youtube\.com[^\s"<>]*/gi);
+  if (ytMatches) {
+    Logger.log(`\nYouTube: あり`);
+    ytMatches.forEach(url => Logger.log(`  ${url}`));
+  } else {
+    Logger.log(`\nYouTube: なし`);
+  }
+  
+  // PDF
+  const pdfMatches = html.match(/<a[^>]+href="([^"]+\.pdf)"[^>]*?>(.*?)<\/a>/gi);
+  if (pdfMatches) {
+    Logger.log(`\nPDF: ${pdfMatches.length}件`);
+    pdfMatches.slice(0, 3).forEach(match => {
+      const urlMatch = match.match(/href="([^"]+)"/);
+      const textMatch = match.match(/>([^<]+)</);
+      if (urlMatch && textMatch) {
+        Logger.log(`  ${textMatch[1].trim()}`);
+      }
+    });
+  } else {
+    Logger.log(`\nPDF: なし`);
+  }
+}
+
+/**
+ * HTML構造の深掘り分析
+ */
+function deepAnalyzeFsaSites() {
+  const sites = [
+    {
+      name: '地域金融力創造WG',
+      url: 'https://www.fsa.go.jp/singi/singi_kinyu/chiikikinyuryoku_wg/chiikikinyuryoku_wg.html'
+    },
+    {
+      name: 'サステナビリティ開示WG',
+      url: 'https://www.fsa.go.jp/singi/singi_kinyu/sustainability_disclose_wg/sustainability_disclose_wg_index.html'
+    },
+    {
+      name: '暗号資産制度WG',
+      url: 'https://www.fsa.go.jp/singi/singi_kinyu/angoshisanseido_wg/angoshisanseido_wg_index.html'
+    }
+  ];
+  
+  sites.forEach((site, idx) => {
+    Logger.log(`\n${'='.repeat(80)}`);
+    Logger.log(`[${idx + 1}/${sites.length}] ${site.name}`);
+    Logger.log('='.repeat(80));
+    
+    const html = fetchText_(site.url);
+    
+    if (!html) {
+      Logger.log('❌ ページ取得失敗');
+      return;
+    }
+    
+    Logger.log(`✅ 取得成功: ${html.length}文字\n`);
+    
+    // 1. HTMLの構造を確認（最初の5000文字）
+    Logger.log('■ HTML冒頭（5000文字）');
+    Logger.log(html.substring(0, 5000));
+    Logger.log('\n');
+    
+    // 2. テーブル構造の確認
+    Logger.log('■ テーブル内容');
+    const tableMatches = html.match(/<table[^>]*?>([\s\S]*?)<\/table>/gi);
+    if (tableMatches) {
+      Logger.log(`テーブル数: ${tableMatches.length}件\n`);
+      
+      // 最初のテーブルの内容
+      if (tableMatches[0]) {
+        const tableText = tableMatches[0]
+          .replace(/<script[^>]*?>[\s\S]*?<\/script>/gi, '')
+          .replace(/<[^>]+>/g, ' ')
+          .replace(/\s+/g, ' ')
+          .trim();
+        
+        Logger.log('最初のテーブル（テキスト抽出）:');
+        Logger.log(tableText.substring(0, 1000));
+      }
     } else {
-      Logger.log(`  ❌ stateなし`);
+      Logger.log('テーブルなし');
+    }
+    
+    Logger.log('\n');
+    
+    // 3. リスト構造の確認
+    Logger.log('■ リスト（ul/li）');
+    const listMatches = html.match(/<ul[^>]*?>([\s\S]*?)<\/ul>/gi);
+    if (listMatches) {
+      Logger.log(`リスト数: ${listMatches.length}件\n`);
+      
+      // 日付を含むリスト項目を抽出
+      listMatches.forEach((list, i) => {
+        if (list.match(/\d{4}[年\/]\d{1,2}[月\/]\d{1,2}/)) {
+          Logger.log(`リスト${i + 1}（日付含む）:`);
+          const listText = list
+            .replace(/<[^>]+>/g, '\n')
+            .replace(/\s+/g, ' ')
+            .trim();
+          Logger.log(listText.substring(0, 500));
+          Logger.log('');
+        }
+      });
+    } else {
+      Logger.log('リストなし');
+    }
+    
+    Logger.log('\n');
+    
+    // 4. PDFリンクの詳細分析
+    Logger.log('■ PDFリンク（最初の10件）');
+    const pdfLinks = [];
+    const pdfPattern = /<a[^>]+href="([^"]+\.pdf)"[^>]*?>([\s\S]*?)<\/a>/gi;
+    let match;
+    
+    while ((match = pdfPattern.exec(html)) !== null) {
+      const url = match[1];
+      const text = match[2].replace(/<[^>]+>/g, '').trim();
+      pdfLinks.push({ url, text });
+    }
+    
+    Logger.log(`PDF総数: ${pdfLinks.length}件\n`);
+    pdfLinks.slice(0, 10).forEach(link => {
+      Logger.log(`  ${link.text}`);
+      Logger.log(`    ${link.url}`);
+    });
+    
+    Logger.log('\n');
+    
+    // 5. 「第N回」パターンの検出
+    Logger.log('■ 「第N回」パターン');
+    const kaiMatches = html.match(/第\s*\d+\s*回/gi);
+    if (kaiMatches) {
+      Logger.log(`検出: ${kaiMatches.length}件`);
+      const unique = [...new Set(kaiMatches)].sort();
+      Logger.log('ユニーク: ' + unique.slice(0, 10).join(', '));
+    } else {
+      Logger.log('なし');
+    }
+    
+    Utilities.sleep(3000);
+  });
+  
+  Logger.log('\n\n' + '='.repeat(80));
+  Logger.log('✅ 深掘り分析完了');
+  Logger.log('='.repeat(80));
+}
+
+function testFsaMeeting() {
+  const sources = getSources_();
+  const fsaSource = sources.find(s => s.name === 'AI官民フォーラム');
+  
+  if (!fsaSource) {
+    Logger.log('❌ AI官民フォーラムが見つかりません');
+    return;
+  }
+  
+  Logger.log('=== 金融庁会議テスト ===\n');
+  Logger.log(`[${fsaSource.id}] ${fsaSource.name}`);
+  Logger.log(`URL: ${fsaSource.indexUrl}\n`);
+  
+  const baseDir = toDir_(fsaSource.indexUrl);
+  const html = fetchText_(fsaSource.indexUrl);
+  
+  if (!html) {
+    Logger.log('❌ ページ取得失敗');
+    return;
+  }
+  
+  Logger.log(`✅ HTML取得: ${html.length}文字\n`);
+  
+  // 会議ページ抽出
+  const pages = extractFsaMeetingPages_(html, baseDir);
+  
+  Logger.log(`✅ 検出された会議: ${pages.length}件\n`);
+  pages.slice(0, 5).forEach(p => {
+    Logger.log(`  ID: ${p.id}`);
+    Logger.log(`  URL: ${p.url}`);
+    Logger.log('');
+  });
+  
+  if (pages.length > 0) {
+    // 最新の会議ページを確認
+    const latest = pages[0];
+    Logger.log(`\n=== 最新会議の詳細 ===`);
+    Logger.log(`ID: ${latest.id}`);
+    Logger.log(`URL: ${latest.url}\n`);
+    
+    const mt = scrapeFsaMeetingPage_(latest.url);
+    
+    if (mt) {
+      Logger.log(`タイトル: ${mt.title}`);
+      Logger.log(`日付: ${mt.date || '未検出'}`);
+      Logger.log(`YouTube: ${mt.youtube || 'なし'}`);
+      Logger.log(`PDF数: ${mt.pdfs.length}`);
+    }
+  }
+}
+
+/**
+ * 金融庁ページの日付抽出をデバッグ
+ */
+function debugFsaDate() {
+  const url = 'https://www.fsa.go.jp/singi/ai_forum/siryou/20251028.html';
+  
+  Logger.log('=== 金融庁ページの日付抽出デバッグ ===');
+  Logger.log('URL: ' + url);
+  
+  const html = fetchText_(url);
+  
+  if (!html) {
+    Logger.log('❌ ページ取得失敗');
+    return;
+  }
+  
+  Logger.log(`✅ HTML取得: ${html.length}文字\n`);
+  
+  // 1. ファイル名から日付を抽出（YYYYMMDD）
+  const urlMatch = url.match(/(\d{8})\.html$/);
+  if (urlMatch) {
+    const dateStr = urlMatch[1];  // 20251028
+    const year = dateStr.substring(0, 4);
+    const month = dateStr.substring(4, 6);
+    const day = dateStr.substring(6, 8);
+    Logger.log(`■ URLから抽出: ${year}年${month}月${day}日\n`);
+  }
+  
+  // 2. HTML内の日付パターンを探す
+  Logger.log('■ HTML内の日付パターン:');
+  
+  // パターン1: YYYY年M月D日
+  const pattern1 = html.match(/\d{4}年\d{1,2}月\d{1,2}日/g);
+  if (pattern1) {
+    Logger.log('  YYYY年M月D日形式:');
+    pattern1.slice(0, 5).forEach(d => Logger.log(`    ${d}`));
+  }
+  
+  // パターン2: 令和X年X月X日
+  const pattern2 = html.match(/令和\d+年\d{1,2}月\d{1,2}日/g);
+  if (pattern2) {
+    Logger.log('  令和形式:');
+    pattern2.slice(0, 5).forEach(d => Logger.log(`    ${d}`));
+  }
+  
+  // パターン3: YYYY/MM/DD
+  const pattern3 = html.match(/\d{4}\/\d{1,2}\/\d{1,2}/g);
+  if (pattern3) {
+    Logger.log('  YYYY/MM/DD形式:');
+    pattern3.slice(0, 5).forEach(d => Logger.log(`    ${d}`));
+  }
+  
+  Logger.log('\n');
+  
+  // 3. <p>タグ内の日付
+  Logger.log('■ <p>タグ内の日付:');
+  const pMatches = html.match(/<p[^>]*?>([^<]*\d{4}[年\/]\d{1,2}[月\/]\d{1,2}[^<]*?)<\/p>/gi);
+  if (pMatches) {
+    pMatches.slice(0, 5).forEach(p => {
+      const text = p.replace(/<[^>]+>/g, '').trim();
+      Logger.log(`  ${text}`);
+    });
+  }
+  
+  Logger.log('\n');
+  
+  // 4. YouTubeリンクの確認
+  Logger.log('■ YouTubeリンク:');
+  const ytMatches = html.match(/https?:\/\/(?:www\.)?youtube\.com[^\s"<>]*/gi);
+  if (ytMatches) {
+    ytMatches.forEach(url => Logger.log(`  ${url}`));
+  } else {
+    Logger.log('  なし');
+  }
+}
+
+/**
+ * AI官民フォーラム第2回のデバッグ
+ */
+function debugFsaDate2() {
+  const url = 'https://www.fsa.go.jp/singi/ai_forum/siryou/20250912.html';
+  
+  Logger.log('=== 金融庁ページ分析（第2回）===');
+  Logger.log('URL: ' + url);
+  
+  const html = fetchText_(url);
+  
+  if (!html) {
+    Logger.log('❌ ページ取得失敗');
+    return;
+  }
+  
+  Logger.log(`✅ HTML取得: ${html.length}文字\n`);
+  
+  // 1. HTML冒頭を表示
+  Logger.log('■ HTML冒頭（3000文字）:');
+  Logger.log(html.substring(0, 3000));
+  Logger.log('\n\n');
+  
+  // 2. 日付パターンを全部探す
+  Logger.log('■ 日付パターン:');
+  
+  const datePatterns = [
+    { name: 'YYYY年M月D日', regex: /\d{4}年\d{1,2}月\d{1,2}日/g },
+    { name: '令和X年X月X日', regex: /令和\d+年\d{1,2}月\d{1,2}日/g },
+    { name: 'YYYY/M/D', regex: /\d{4}\/\d{1,2}\/\d{1,2}/g },
+    { name: 'YYYY.M.D', regex: /\d{4}\.\d{1,2}\.\d{1,2}/g }
+  ];
+  
+  datePatterns.forEach(p => {
+    const matches = html.match(p.regex);
+    if (matches) {
+      Logger.log(`  ${p.name}: ${matches.length}件`);
+      matches.slice(0, 3).forEach(m => Logger.log(`    ${m}`));
+    }
+  });
+  
+  Logger.log('\n');
+  
+  // 3. <p>タグ内の日付を詳細に
+  Logger.log('■ <p>タグ内の内容（日付含む行）:');
+  const pTags = html.match(/<p[^>]*?>[^<]*?<\/p>/gi);
+  if (pTags) {
+    pTags.forEach(p => {
+      const text = p.replace(/<[^>]+>/g, '').trim();
+      if (text.match(/\d{4}[年\.\/]\d{1,2}[月\.\/]\d{1,2}/)) {
+        Logger.log(`  ${text}`);
+      }
+    });
+  }
+  
+  Logger.log('\n');
+  
+  // 4. YouTubeリンクを詳細に
+  Logger.log('■ YouTubeリンクの詳細:');
+  
+  // すべてのaタグを抽出
+  const aLinks = html.match(/<a[^>]+href="([^"]*youtube[^"]*)"[^>]*?>(.*?)<\/a>/gi);
+  if (aLinks) {
+    Logger.log(`  YouTubeリンク総数: ${aLinks.length}件\n`);
+    aLinks.forEach(link => {
+      const urlMatch = link.match(/href="([^"]+)"/);
+      const textMatch = link.match(/>([^<]+)</);
+      if (urlMatch) {
+        Logger.log(`  URL: ${urlMatch[1]}`);
+        if (textMatch) {
+          Logger.log(`  テキスト: ${textMatch[1].trim()}`);
+        }
+        Logger.log('');
+      }
+    });
+  } else {
+    Logger.log('  なし');
+  }
+  
+  // 5. YouTube直接リンク
+  Logger.log('■ YouTube URL（href以外も含む）:');
+  const ytUrls = html.match(/https?:\/\/(?:www\.)?youtu(?:\.be|be\.com)[^\s"<>]*/gi);
+  if (ytUrls) {
+    ytUrls.forEach(url => Logger.log(`  ${url}`));
+  }
+}
+
+/**
+ * YouTubeリンク周辺のHTMLを確認
+ */
+function debugYouTubeContext() {
+  const url = 'https://www.fsa.go.jp/singi/ai_forum/siryou/20250912.html';
+  
+  Logger.log('=== YouTube周辺のHTML ===');
+  Logger.log('URL: ' + url);
+  
+  const html = fetchText_(url);
+  
+  if (!html) {
+    Logger.log('❌ ページ取得失敗');
+    return;
+  }
+  
+  Logger.log(`✅ HTML取得: ${html.length}文字\n`);
+  
+  // youtu.beを含む部分の前後500文字を抽出
+  const ytPosition = html.indexOf('youtu.be/GW85n84F4Q4');
+  
+  if (ytPosition > -1) {
+    const start = Math.max(0, ytPosition - 500);
+    const end = Math.min(html.length, ytPosition + 500);
+    const context = html.substring(start, end);
+    
+    Logger.log('■ YouTube周辺のHTML（前後500文字）:');
+    Logger.log(context);
+  } else {
+    Logger.log('❌ YouTubeリンクが見つかりません');
+  }
+}
+
+/**
+ * 第3回のHTML構造を確認
+ */
+function debugFsa3rdMeeting() {
+  const url = 'https://www.fsa.go.jp/singi/ai_forum/siryou/20251028.html';
+  
+  Logger.log('=== 第3回の分析 ===');
+  Logger.log('URL: ' + url);
+  
+  const html = fetchText_(url);
+  
+  if (!html) {
+    Logger.log('❌ ページ取得失敗');
+    return;
+  }
+  
+  Logger.log(`✅ HTML取得: ${html.length}文字\n`);
+  
+  // 1. タイトル
+  const titleMatch = html.match(/<title[^>]*?>(.*?)<\/title>/i);
+  if (titleMatch) {
+    Logger.log(`タイトル: ${titleMatch[1]}\n`);
+  }
+  
+  // 2. <li>タグ内の「日時」を探す
+  Logger.log('■ <li>タグで「日時」を含む行:');
+  const liMatches = html.match(/<li[^>]*?>[^<]*?日時[^<]*?<\/li>/gi);
+  if (liMatches) {
+    liMatches.forEach(li => {
+      const text = li.replace(/<[^>]+>/g, '').trim();
+      Logger.log(`  ${text}`);
+    });
+  } else {
+    Logger.log('  なし');
+  }
+  
+  Logger.log('\n');
+  
+  // 3. 「令和」または「年月日」を含む部分（広く）
+  Logger.log('■ 日付らしきテキスト:');
+  const dateLines = html.split('\n').filter(line => 
+    line.match(/令和\d+年|202[0-9]年\d+月\d+日/)
+  );
+  dateLines.slice(0, 5).forEach(line => {
+    const cleaned = line.replace(/<[^>]+>/g, '').trim();
+    if (cleaned) Logger.log(`  ${cleaned}`);
+  });
+  
+  Logger.log('\n');
+  
+  // 4. YouTube
+  Logger.log('■ YouTube関連:');
+  const ytUrls = html.match(/https?:\/\/(?:www\.)?youtu(?:\.be|be\.com)[^\s"<>]*/gi);
+  if (ytUrls) {
+    ytUrls.forEach(url => Logger.log(`  ${url}`));
+  } else {
+    Logger.log('  なし');
+  }
+  
+  Logger.log('\n');
+  
+  // 5. メインコンテンツ部分を表示
+  Logger.log('■ <h1>以降のコンテンツ（3000文字）:');
+  const h1Position = html.indexOf('<h1');
+  if (h1Position > -1) {
+    Logger.log(html.substring(h1Position, h1Position + 3000));
+  }
+}
+
+/**
+ * 日付抽出の正規表現をデバッグ
+ */
+function debugDateRegex() {
+  const url = 'https://www.fsa.go.jp/singi/ai_forum/siryou/20251028.html';
+  
+  Logger.log('=== 日付正規表現デバッグ ===');
+  
+  const html = fetchText_(url);
+  
+  if (!html) {
+    Logger.log('❌ ページ取得失敗');
+    return;
+  }
+  
+  Logger.log(`✅ HTML取得: ${html.length}文字\n`);
+  
+  // 1. 該当行を抽出
+  Logger.log('■ <li>タグで日時を含む行:');
+  const liMatch = html.match(/<li[^>]*?>日時[：:][^<]*?<\/li>/i);
+  if (liMatch) {
+    Logger.log(`生のHTML: ${liMatch[0]}`);
+    const text = liMatch[0].replace(/<[^>]+>/g, '');
+    Logger.log(`テキスト: ${text}`);
+    Logger.log('');
+  }
+  
+  // 2. 文字コードを確認
+  Logger.log('■ 「７」の文字コード確認:');
+  const sevenMatch = html.match(/令和(.)/);
+  if (sevenMatch) {
+    const char = sevenMatch[1];
+    const code = char.charCodeAt(0);
+    Logger.log(`文字: "${char}"`);
+    Logger.log(`文字コード: ${code}`);
+    Logger.log(`全角７の文字コード: ${('７').charCodeAt(0)}`);
+    Logger.log(`半角7の文字コード: ${('7').charCodeAt(0)}`);
+    Logger.log('');
+  }
+  
+  // 3. 各正規表現パターンをテスト
+  Logger.log('■ 正規表現テスト:');
+  
+  const patterns = [
+    { name: '半角のみ', regex: /<li[^>]*?>日時[：:]\s*令和(\d+)年(\d+)月(\d+)日/i },
+    { name: '全角のみ', regex: /<li[^>]*?>日時[：:]\s*令和([０-９]+)年([０-９]+)月([０-９]+)日/i },
+    { name: '混在', regex: /<li[^>]*?>日時[：:]\s*令和([0-9０-９]+)年([0-9０-９]+)月([0-9０-９]+)日/i },
+    { name: '柔軟', regex: /<li[^>]*?>日時[：:]\s*令和(.+?)年(.+?)月(.+?)日/i }
+  ];
+  
+  patterns.forEach(p => {
+    const match = html.match(p.regex);
+    if (match) {
+      Logger.log(`✅ ${p.name}: マッチ`);
+      Logger.log(`   年: "${match[1]}"`);
+      Logger.log(`   月: "${match[2]}"`);
+      Logger.log(`   日: "${match[3]}"`);
+    } else {
+      Logger.log(`❌ ${p.name}: マッチせず`);
     }
     Logger.log('');
   });
 }
 
+
 /**
- * 実際のHTMLから日付部分を探す
+ * 実際に動いているコードをテスト
  */
-function debugDateInHtml() {
-  const url = 'https://www.meti.go.jp/shingikai/energy_environment/doji_shijo_kento/020.html';
+function testActualDateExtraction() {
+  const url = 'https://www.fsa.go.jp/singi/ai_forum/siryou/20251028.html';
   
-  Logger.log('=== HTML内の日付を探す ===');
-  Logger.log('URL: ' + url);
-  Logger.log('');
+  Logger.log('=== 実際の関数で日付抽出テスト ===');
   
-  const html = fetchText_(url);
+  const mt = scrapeFsaMeetingPage_(url);
   
-  if (!html) {
-    Logger.log('❌ HTML取得失敗');
+  if (!mt) {
+    Logger.log('❌ scrapeFsaMeetingPage_ が null を返しました');
     return;
   }
   
-  Logger.log('✅ HTML取得成功: ' + html.length + '文字');
-  Logger.log('');
+  Logger.log(`タイトル: ${mt.title}`);
+  Logger.log(`日付: ${mt.date || '未検出'}`);
+  Logger.log(`YouTube: ${mt.youtube || 'なし'}`);
+  Logger.log(`PDF数: ${mt.pdfs.length}`);
   
-  // HTMLの最初の2000文字を表示（日付が含まれていることが多い）
-  Logger.log('=== HTML冒頭 ===');
-  Logger.log(html.substring(0, 2000));
-  Logger.log('');
+  // デバッグ：normalizeNum_関数のテスト
+  Logger.log('\n■ normalizeNum_関数のテスト:');
+  Logger.log(`"７" → ${normalizeNum_('７')}`);
+  Logger.log(`"11" → ${normalizeNum_('11')}`);
+  Logger.log(`"５" → ${normalizeNum_('５')}`);
+}
+
+/**
+ * 他の金融庁会議をテスト
+ */
+function testOtherFsaMeetings() {
+  const sources = getSources_();
   
-  // 「年」「月」「日」を含む行を抽出
-  Logger.log('=== 「年月日」を含む部分 ===');
-  const lines = html.split('\n');
-  let count = 0;
+  const meetings = [
+    '暗号資産制度WG',
+    'サステナビリティ開示WG'
+  ];
   
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    if (line.includes('年') && line.includes('月') && line.includes('日')) {
-      Logger.log(`[${i}] ${line.trim()}`);
-      count++;
-      if (count >= 10) break;  // 最初の10件のみ
+  meetings.forEach(name => {
+    const src = sources.find(s => s.name.includes(name.split('WG')[0]));
+    
+    if (!src) {
+      Logger.log(`❌ ${name} が見つかりません\n`);
+      return;
     }
-  }
+    
+    Logger.log(`\n${'='.repeat(60)}`);
+    Logger.log(`[${src.id}] ${src.name}`);
+    Logger.log('='.repeat(60));
+    
+    const baseDir = toDir_(src.indexUrl);
+    const html = fetchText_(src.indexUrl);
+    
+    if (!html) {
+      Logger.log('❌ ページ取得失敗\n');
+      return;
+    }
+    
+    const pages = extractFsaMeetingPages_(html, baseDir);
+    Logger.log(`検出: ${pages.length}件\n`);
+    
+    if (pages.length > 0) {
+      const latest = pages[0];
+      Logger.log(`最新: ID=${latest.id}`);
+      Logger.log(`URL: ${latest.url}\n`);
+      
+      const mt = scrapeFsaMeetingPage_(latest.url);
+      
+      if (mt) {
+        Logger.log(`タイトル: ${mt.title}`);
+        Logger.log(`日付: ${mt.date || '未検出'}`);
+        Logger.log(`YouTube: ${mt.youtube || 'なし'}`);
+        Logger.log(`PDF数: ${mt.pdfs.length}`);
+      }
+    }
+    
+    Utilities.sleep(2000);
+  });
   
-  if (count === 0) {
-    Logger.log('❌ 「年月日」を含む行が見つかりません');
-  }
-  
-  Logger.log('');
-  Logger.log('=== タイトルタグ ===');
-  const titleMatch = html.match(/<title[^>]*?>(.*?)<\/title>/i);
-  if (titleMatch) {
-    Logger.log(titleMatch[1]);
-  }
+  Logger.log('\n\n✅ 全会議テスト完了');
 }
 
-function testDateExtraction() {
-  const url = 'https://www.meti.go.jp/shingikai/energy_environment/doji_shijo_kento/020.html';
-  
-  Logger.log('=== 日付抽出テスト ===');
-  Logger.log('URL: ' + url);
-  
-  const mt = scrapeMeetingPage_(url);
-  
-  if (mt) {
-    Logger.log('タイトル: ' + mt.title);
-    Logger.log('日付: ' + (mt.date || '❌ 取得失敗'));
-    Logger.log('YouTube: ' + (mt.youtube || 'なし'));
-    Logger.log('PDF数: ' + mt.pdfs.length);
-  } else {
-    Logger.log('❌ ページ取得失敗');
-  }
-}
-
-function clearMeetingDates() {
+/**
+ * 金融庁会議の初回シード
+ */
+function seedFsaMeetings() {
   const state = loadState_();
   const sources = getSources_();
   
-  for (const src of sources) {
-    if (state[src.indexUrl]) {
-      delete state[src.indexUrl].lastMeetingDate;
+  const fsaSources = sources.filter(s => s.agency === '金融庁');
+  
+  Logger.log('=== 金融庁会議の初回シード ===\n');
+  Logger.log(`対象: ${fsaSources.length}会議\n`);
+  
+  fsaSources.forEach(src => {
+    Logger.log(`\n[${src.id}] ${src.name}`);
+    
+    // 既にシード済みか確認
+    if (state[src.indexUrl] && state[src.indexUrl].lastId) {
+      Logger.log('  ⚠️ 既にシード済み、スキップ');
+      return;
     }
-  }
+    
+    const baseDir = toDir_(src.indexUrl);
+    const html = fetchText_(src.indexUrl);
+    
+    if (!html) {
+      Logger.log('  ❌ ページ取得失敗');
+      return;
+    }
+    
+    const pages = extractFsaMeetingPages_(html, baseDir);
+    
+    if (!pages.length) {
+      Logger.log('  ❌ 会議ページが見つかりません');
+      return;
+    }
+    
+    const latest = pages[0];
+    const mt = scrapeFsaMeetingPage_(latest.url);
+    
+    // 初回シード
+    state[src.indexUrl] = {
+      lastId: latest.id,
+      lastUrl: latest.url,
+      lastMeetingDate: mt ? mt.date : '',
+      lastCheckedAt: new Date().toISOString(),
+      pendingSummary: null
+    };
+    
+    Logger.log(`  ✅ シード完了: 第${latest.id}回 (${mt ? mt.date : '日付不明'})`);
+    
+    Utilities.sleep(2000);
+  });
   
   saveState_(state);
-  Logger.log('✅ 全ての日付情報をクリアしました');
+  
+  Logger.log('\n\n✅ 初回シード完了');
 }
