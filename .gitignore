@@ -1,0 +1,30 @@
+# バックアップフォルダ
+_bk/
+
+# OS関連
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# エディタ関連
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ログファイル
+*.log
+
+# 一時ファイル
+*.tmp
+*.temp
+
+# 環境変数・機密情報
+.env
+.env.local
+config.local.js
+
+# node_modules（もし使用している場合）
+node_modules/
+
