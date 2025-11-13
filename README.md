@@ -2,9 +2,10 @@
 
 経済産業省・金融庁の政府会議を自動監視し、AIで要約してメール配信するシステム
 
-**最終更新**: 2025-11-12  
-**バージョン**: 0.3.0  
-**監視会議数**: 11会議（経産省8 + 金融庁3）
+**最終更新**: 2025-11-13  
+**バージョン**: 0.3.1  
+**監視会議数**: 14会議（経産省8 + 金融庁6）  
+**稼働状況**: α版稼働中（VPS復旧完了）
 
 ---
 
@@ -14,38 +15,63 @@
 政府会議の情報を民主化し、政策決定プロセスの透明性を高める
 
 ### 主要機能
-- ✅ 11会議の自動監視（毎日09:00 JST）
+- ✅ 14会議の自動監視（毎日09:00 JST）
 - ✅ 新着会議の自動検知
-- ✅ PDF OCR処理（VPS上でpdfplumber）
+- ✅ PDF OCR処理（VPS上でPyMuPDF）
 - ✅ YouTube字幕取得（yt-dlp）
-- ✅ Gemini 2.0 Flash Experimentalによる要約
+- ✅ Gemini 2.5 Flashによる要約
 - ✅ 購読者へのメール配信
 - ✅ Archive機能（送信済み会議の管理）
-- ✅ セキュリティ監視（fail2ban、Basic認証）
+- ✅ セキュリティ監視（fail2ban）
 
 ### システム構成
 ```
-┌─────────────────────────────────────────────────────┐
-│ Google Apps Script (GAS)                            │
-│ ├─ 会議監視・検知                                    │
-│ ├─ 購読者管理                                        │
-│ ├─ メール配信                                        │
-│ └─ 全体オーケストレーション                          │
-└─────────────────────────────────────────────────────┘
-                        ↓↑ HTTP
-┌─────────────────────────────────────────────────────┐
-│ VPS (Ubuntu 24.04 LTS) - Docker                     │
-│ ├─ fetcher: HTML取得                                 │
-│ ├─ pdf-processor: PDF OCR                           │
-│ ├─ youtube-processor: 字幕取得                       │
-│ └─ security: fail2ban監視                            │
-└─────────────────────────────────────────────────────┘
-                        ↓↑ API
-┌─────────────────────────────────────────────────────┐
-│ Google Gemini API                                   │
-│ └─ gemini-2.0-flash-exp (要約生成)                   │
-└─────────────────────────────────────────────────────┘
+┌─────────────────────────────────────┐
+│         Google Apps Script          │
+│   - メール配信                        │
+│   - スケジュール実行                   │
+│   - 会議情報の解析                    │
+└──────────┬──────────────────────────┘
+           │ HTTPS
+           ↓
+┌─────────────────────────────────────┐
+│  Nginx (fetch.klammer.co.jp)        │
+│   - リバースプロキシ                  │
+│   - SSL終端                          │
+│   - Basic認証（計画中）               │
+└──────────┬──────────────────────────┘
+           │
+     ┌─────┴─────┐
+     ↓           ↓
+┌─────────┐  ┌─────────┐
+│fetcher  │  │  asr    │
+│:3000    │  │  :8080  │
+│Node.js  │  │ Python  │
+│PM2      │  │ Docker  │
+└─────────┘  └─────────┘
+  ↓              ↓
+Webページ    YouTube字幕
+取得          PDF OCR
+           
+           ↓
+┌─────────────────────────────────────┐
+│         Google Gemini API           │
+│   - gemini-2.5-flash (要約生成)      │
+└─────────────────────────────────────┘
 ```
+
+### 技術スタック
+- **GAS**: メインロジック、メール配信
+- **Node.js (fetcher)**: Webスクレイピング
+- **Python (asr)**: OCR、字幕取得
+- **Nginx**: リバースプロキシ、SSL
+- **Gemini API**: AI要約
+- **VPS**: Ubuntu 24.04
+
+### 最近の更新
+- 2025-11-13: **VPS復旧完了**（サイバー攻撃からの復旧）
+- 2025-11-13: Nginx設定修正（port 3000へ）
+- 2025-11-12: 監視会議を11→14に拡大
 
 ---
 
@@ -66,14 +92,6 @@
 - 会議ページ: `https://www.meti.go.jp/shingikai/.../001.html`
 - ID形式: 連番（1, 2, 3, ...）
 
-#### 日付の取得
-- HTML内の `<p>` タグから「令和X年X月X日」または「YYYY年MM月DD日」を抽出
-- 全角・半角混在に対応
-
-#### YouTube
-- 会議ページ内に直接リンク（/watch?v=, /live/, youtu.be/）
-- 配信がない会議も多い
-
 #### 対象会議一覧
 1. 同時市場の在り方等に関する検討会
 2. 電力システム改革の検証を踏まえた制度設計WG
@@ -84,7 +102,7 @@
 7. 次世代の分散型電力システムに関する検討会
 8. GXリーグにおけるサプライチェーンでの取組のあり方に関する研究会
 
-### 金融庁（3会議）
+### 金融庁（6会議）
 
 #### 会議の構造
 ```
@@ -99,27 +117,13 @@
 - 資料ページ: `https://www.fsa.go.jp/singi/.../siryou/YYYYMMDD.html`
 - ID形式: 日付（YYYYMMDD形式）
 
-#### ディレクトリパターン
-| 会議 | 資料 | 議事要旨 |
-|------|------|----------|
-| AI官民フォーラム | `siryou/` | `gijiyoshi/` |
-| 暗号資産制度WG | `gijishidai/` | `gijiroku/` |
-| サステナビリティ開示WG | `shiryou/` | `gijiroku/` |
-
-#### 日付の取得
-- HTML内の `<li>日時：令和X年X月X日` から抽出
-- 全角数字に対応（令和７年 → 2025年）
-- フォールバック: URLから `YYYYMMDD` を抽出
-
-#### YouTube
-- 個別動画リンク（/watch?v=, /live/, youtu.be/）のみ対象
-- チャンネルリンク（/channel/）は除外
-- 「後日配信予定」の場合はリンクなし
-
 #### 対象会議一覧
 9. AI官民フォーラム
 10. 暗号資産制度に関するワーキング・グループ
 11. サステナビリティ情報の開示と保証のあり方に関するワーキング・グループ
+12. 市場制度ワーキング・グループ
+13. ディスクロージャーワーキング・グループ
+14. コーポレートガバナンス・コードの改訂に関する有識者会議
 
 ---
 
@@ -152,45 +156,12 @@ else if (src.agency === '金融庁') {
 }
 ```
 
-#### 会議ページ抽出
-
-**経産省**: `extractMeetingPages_()`
-- パターン: `/XXX/(\d{3,4})\.html`
-- 例: `/020.html` → ID: 20
-
-**金融庁**: `extractFsaMeetingPages_()`
-- パターン: `/(siryou|shiryou|gijishidai)/(\d{8})\.html`
-- 例: `/siryou/20251028.html` → ID: 20251028
-
-#### 会議ページのスクレイピング
-
-**経産省**: `scrapeMeetingPage_()`
-```javascript
-{
-  title: "第20回 同時市場の在り方等に関する検討会",
-  date: "2025年9月22日",
-  format: "ハイブリッド形式",
-  roster: "委員名簿PDFのURL",
-  youtube: "https://www.youtube.com/watch?v=...",
-  pdfs: [
-    { url: "...", title: "議事次第", isAgenda: true, ... },
-    { url: "...", title: "資料1", refType: "資料", refNo: 1, ... }
-  ],
-  pageUrl: "https://www.meti.go.jp/..."
-}
-```
-
-**金融庁**: `scrapeFsaMeetingPage_()`
-- 日付抽出: `<li>日時：令和X年X月X日` から
-- YouTube: 個別動画のみ（チャンネルリンクを除外）
-- PDF: 経産省と同じ構造
-
 ### 2. コンテンツ処理
 
 #### `processMeeting_(mt, srcId)`
 ```
-1. YouTube字幕取得（VPS）
-2. PDF OCR処理（VPS）
+1. YouTube字幕取得（VPS/asr）
+2. PDF OCR処理（VPS/asr）
 3. コンテンツ統合
 4. Gemini API で要約生成
 5. メール本文作成
@@ -200,21 +171,19 @@ else if (src.agency === '金融庁') {
 
 #### VPS連携
 
-**HTML取得**: `fetchViaVps_(url)`
+**HTML取得**: `fetchViaVps_()` → fetcher (port 3000)
 ```javascript
-const response = UrlFetchApp.fetch(VPS_URL + '/fetch', {
-  method: 'POST',
-  payload: JSON.stringify({ url, timeout: 30 }),
-  headers: { 'Content-Type': 'application/json' },
-  muteHttpExceptions: true
+const fetcherUrl = CONFIG.SUBS.BASE_URL + '/fetcher/crawl?url=' + encodeURIComponent(url);
+const res = UrlFetchApp.fetch(fetcherUrl, {
+  headers: { 'Authorization': 'Bearer ' + CONFIG.SUBS.TOKEN }
 });
 ```
 
-**PDF処理**: `/process-pdf`
-- pdfplumber でテキスト抽出
+**PDF処理**: `/ocr` → asr (port 8080)
+- PyMuPDF でテキスト抽出
 - OCR処理（画像PDF対応）
 
-**YouTube処理**: `/process-youtube`
+**YouTube処理**: `/transcript` → asr (port 8080)
 - yt-dlp で字幕取得
 - 自動生成字幕対応
 
@@ -222,7 +191,7 @@ const response = UrlFetchApp.fetch(VPS_URL + '/fetch', {
 
 #### Gemini API設定
 ```javascript
-model: "gemini-2.0-flash-exp"
+model: "gemini-2.5-flash"
 temperature: 0.3
 maxOutputTokens: 4096
 ```
@@ -259,18 +228,6 @@ maxOutputTokens: 4096
 - `sources`: 購読する会議ID（カンマ区切り）
 - 空欄 or "all" = 全会議購読
 
-#### 配信ロジック
-```javascript
-function getRecipientsForSource_(sourceId) {
-  const allRecipients = getRecipients_();
-  return allRecipients.filter(r => {
-    if (!r.sources || r.sources === 'all') return true;
-    const ids = r.sources.split(',').map(s => parseInt(s.trim()));
-    return ids.includes(sourceId);
-  });
-}
-```
-
 ### 5. データ管理
 
 #### state スクリプトプロパティ
@@ -280,7 +237,7 @@ function getRecipientsForSource_(sourceId) {
     "lastId": 20,
     "lastUrl": "https://www.meti.go.jp/.../020.html",
     "lastMeetingDate": "2025年9月22日",
-    "lastCheckedAt": "2025-11-12T05:00:00.000Z",
+    "lastCheckedAt": "2025-11-13T00:00:00.000Z",
     "pendingSummary": null
   }
 }
@@ -289,22 +246,27 @@ function getRecipientsForSource_(sourceId) {
 #### archive シート
 | timestamp | sourceId | meetingId | title | sentTo | status |
 |-----------|----------|-----------|-------|--------|--------|
-| 2025-11-12 10:00 | 1 | 20 | 第20回... | 5 | sent |
+| 2025-11-13 10:00 | 1 | 20 | 第20回... | 5 | sent |
 
 ---
 
 ## 🔒 セキュリティ
 
 ### VPSセキュリティ
-- **Basic認証**: 全エンドポイント
 - **fail2ban**: 不正アクセス検知・自動ブロック
+- **SSL/TLS**: Let's Encrypt証明書
 - **ファイアウォール**: UFW設定
 - **Docker分離**: コンテナ化
+- **Basic認証**: 計画中
 
 ### GASセキュリティ
 - **API Key管理**: スクリプトプロパティ
 - **HTTPS通信**: 全通信暗号化
 - **エラーハンドリング**: 詳細ログ記録
+
+### セキュリティインシデント対応
+- 2025-11-13: サイバー攻撃を検知・復旧完了（約4時間）
+- fail2banによる自動ブロック機能が有効
 
 ---
 
@@ -327,17 +289,19 @@ public-mtg-monitor2/
 │   ├── utils.gs                # ユーティリティ
 │   └── security-monitor.gs     # セキュリティ監視
 ├── vps/
-│   ├── docker-compose.yml
-│   ├── fetcher/
-│   ├── pdf-processor/
-│   ├── youtube-processor/
-│   └── security/
+│   ├── fetcher/                # Node.js Webスクレイパー
+│   │   ├── index.js
+│   │   └── package.json
+│   └── asr/                    # Python OCR/字幕取得
+│       ├── app.py
+│       ├── Dockerfile
+│       └── requirements.txt
 ├── docs/
-│   ├── ARCHITECTURE.md
-│   ├── DEPLOYMENT.md
-│   ├── CHANGELOG.md
-│   └── ROADMAP.md
-└── README.md
+│   ├── README.md               # このファイル
+│   ├── ROADMAP.md              # 開発ロードマップ
+│   ├── ARCHITECTURE.md         # 詳細設計
+│   └── TROUBLESHOOTING.md      # 運用手順
+└── .clasp.json
 ```
 
 ---
@@ -383,8 +347,8 @@ clasp push
 // GASエディタ > プロジェクトの設定 > スクリプトプロパティ
 
 GEMINI_API_KEY = "your-gemini-api-key"
-VPS_URL = "https://your-vps-domain.com"
-VPS_AUTH = "username:password" (Base64エンコード)
+VPS_FETCH_BASE = "https://fetch.klammer.co.jp"
+VPS_FETCH_TOKEN = "your-token"
 SOURCES_SHEET_ID = "your-sources-sheet-id"
 RECIPIENTS_SHEET_ID = "your-recipients-sheet-id"
 ARCHIVE_SHEET_ID = "your-archive-sheet-id"
@@ -393,17 +357,19 @@ ARCHIVE_SHEET_ID = "your-archive-sheet-id"
 ### 4. VPS セットアップ
 
 ```bash
-# Docker Compose起動
-cd vps
+# fetcher起動（PM2）
+cd /root/fetcher
+pm2 start index.js --name fetcher
+pm2 save
+
+# asr起動（Docker）
+cd /root/asr
 docker-compose up -d
 
-# Basic認証設定（各Dockerfile内）
-ENV BASIC_AUTH_USER=username
-ENV BASIC_AUTH_PASS=password
-
-# fail2ban設定
-sudo systemctl enable fail2ban
-sudo systemctl start fail2ban
+# Nginx設定確認
+sudo nano /etc/nginx/sites-enabled/default
+# port 3000を指定
+sudo systemctl reload nginx
 ```
 
 ### 5. トリガー設定
@@ -426,7 +392,7 @@ GASエディタ > トリガー > トリガーを追加
 ```
 09:00 JST - dailyCheckAll() 実行
   ↓
-11会議を順次チェック
+14会議を順次チェック
   ↓
 新着会議を検知
   ↓
@@ -452,6 +418,7 @@ Gemini で要約生成
 #### 月次
 - 購読者管理
 - 監視会議の見直し
+- コスト確認
 
 ---
 
@@ -459,19 +426,32 @@ Gemini で要約生成
 
 ### よくある問題
 
-#### 1. PDF処理が失敗する
+#### 1. VPS全体がダウン
 ```
-原因: VPSのpdf-processorがダウン
-対応: docker-compose restart pdf-processor
+原因: サイバー攻撃、システム障害
+対応手順:
+1. VPSにSSH接続
+2. fail2banログ確認: sudo tail -f /var/log/fail2ban.log
+3. サービス再起動:
+   - fetcher: pm2 restart fetcher
+   - asr: docker restart asr-asr-1
+4. Nginx確認: sudo systemctl status nginx
+5. 設定確認: cat /etc/nginx/sites-enabled/default
 ```
 
-#### 2. YouTube字幕が取得できない
+#### 2. PDF処理が失敗する
+```
+原因: asrコンテナがダウン
+対応: docker restart asr-asr-1
+```
+
+#### 3. YouTube字幕が取得できない
 ```
 原因: 字幕が存在しない、またはyt-dlpエラー
 対応: ログ確認、手動字幕確認
 ```
 
-#### 3. Gemini APIエラー
+#### 4. Gemini APIエラー
 ```
 原因: レート制限、API Key問題
 対応: 
@@ -479,12 +459,14 @@ Gemini で要約生成
 - API Key → スクリプトプロパティ確認
 ```
 
-#### 4. メール配信されない
+#### 5. fetcherが503エラー
 ```
-原因: Gmail送信制限、購読設定ミス
+原因: Nginxのproxy_pass設定ミス
 対応:
-- Gmail制限 → 1日の送信数確認
-- 購読設定 → recipientsシート確認
+1. sudo nano /etc/nginx/sites-enabled/default
+2. proxy_pass http://127.0.0.1:3000 を確認
+3. sudo nginx -t
+4. sudo systemctl reload nginx
 ```
 
 ### ログ確認
@@ -498,10 +480,15 @@ Logger.log() の出力を確認
 
 #### VPS
 ```bash
-# Dockerログ
-docker-compose logs -f fetcher
-docker-compose logs -f pdf-processor
-docker-compose logs -f youtube-processor
+# fetcherログ
+pm2 logs fetcher --lines 50
+
+# asrログ
+docker logs asr-asr-1 | tail -50
+
+# Nginxログ
+sudo tail -f /var/log/nginx/error.log
+sudo tail -f /var/log/nginx/access.log
 
 # fail2banログ
 sudo tail -f /var/log/fail2ban.log
@@ -516,6 +503,7 @@ sudo tail -f /var/log/fail2ban.log
 - **エラー率**: 5%以下
 - **平均処理時間**: 会議あたり2-3分
 - **メール配信成功率**: 95%以上
+- **復旧時間**: 4時間以内
 
 ### ダッシュボード
 - Archive シート: 配信履歴
@@ -524,24 +512,30 @@ sudo tail -f /var/log/fail2ban.log
 
 ---
 
-## 🔮 今後の拡張
+## 🔮 今後の展開
 
-### Phase 1: スケーラビリティ（2-3週間）
-- 20会議 → 100会議への拡大
-- グループ分割処理の実装
-- エラーハンドリング強化
+詳細は **[ROADMAP.md](docs/ROADMAP.md)** を参照
 
-### Phase 2: 課金基盤（1ヶ月）
-- Stripe統合
-- ユーザー管理
-- サブスクリプション機能
+### Phase 1: 運用安定化（現在）
+- ✅ 14会議監視体制
+- ✅ VPS復旧手順確立
+- [ ] 自動バックアップ
+- [ ] セキュリティ強化
 
-### Phase 3: プレミアム機能（2ヶ月）
-- キーワードアラート
-- カスタム配信フォーマット
-- 高度な分析
+### Phase 2: スケーラビリティ（2-3週間）
+- [ ] 20会議 → 100会議への拡大
+- [ ] グループ分割処理
+- [ ] エラーハンドリング強化
 
-詳細は `docs/ROADMAP.md` 参照
+### Phase 3: 課金基盤（1ヶ月）
+- [ ] Stripe統合
+- [ ] ユーザー管理
+- [ ] サブスクリプション
+
+### Phase 4: プレミアム機能（2ヶ月）
+- [ ] キーワードアラート
+- [ ] カスタム配信
+- [ ] 高度な分析
 
 ---
 
@@ -551,6 +545,11 @@ sudo tail -f /var/log/fail2ban.log
 - **名前**: Toshihiro Higaki
 - **会社**: Klammer Corporation
 - **Email**: toshihiro.higaki@klammer.co.jp
+
+### ドキュメント
+- **ROADMAP**: [docs/ROADMAP.md](docs/ROADMAP.md) - 開発計画
+- **ARCHITECTURE**: 詳細設計（作成予定）
+- **TROUBLESHOOTING**: 運用手順（作成予定）
 
 ### リポジトリ
 - **GitHub**: (private repository)
@@ -564,5 +563,6 @@ Private - All Rights Reserved
 
 ---
 
-**最終更新**: 2025-11-12  
-**バージョン**: 0.3.0
+**最終更新**: 2025-11-13  
+**バージョン**: 0.3.1  
+**次回マイルストーン**: Phase 1完了（20会議監視、自動バックアップ）
