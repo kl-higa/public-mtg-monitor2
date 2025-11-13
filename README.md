@@ -64,16 +64,138 @@ Webページ    YouTube字幕
 - **GAS**: メインロジック、メール配信
 - **Node.js (fetcher)**: Webスクレイピング
 - **Python (asr)**: OCR、字幕取得
+  - yt-dlp==2025.11.12 ⚠️ バージョン固定
+  - Deno 2.5.6 ⚠️ PO Token生成に必須
+  - faster-whisper==1.1.0
+  - PyMuPDF (OCR)
 - **Nginx**: リバースプロキシ、SSL
 - **Gemini API**: AI要約
 - **VPS**: Ubuntu 24.04
 
+### 依存関係管理
+
+⚠️ **外部API依存の重要性**
+
+YouTube、Gemini APIなど外部サービスは予告なく仕様変更される可能性があります。
+
+**対策**:
+1. **バージョン固定**: requirements.txt で明示的に指定
+2. **定期チェック**: 月1回、依存ライブラリのリリースノートを確認
+3. **監視強化**: エラーの詳細を常に記録
+4. **デバッグモード**: 環境変数で切り替え可能
+
+#### requirements.txt（例）
+```txt
+yt-dlp==2025.11.12  # ← 固定
+faster-whisper==1.1.0
+google-generativeai==0.8.3
+PyMuPDF==1.23.8
+```
+
+#### 定期アップデート手順
+```bash
+# 月1回実施
+# 1. リリースノート確認
+# https://github.com/yt-dlp/yt-dlp/releases
+
+# 2. コンテナ内でアップデート
+docker exec -it asr_asr_1 pip install -U yt-dlp --break-system-packages
+
+# 3. テスト実行
+curl -X POST https://fetch.klammer.co.jp/asr/youtube-subs \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"url":"test-url"}'
+
+# 4. 問題なければ requirements.txt 更新
+# 5. 再ビルド
+docker-compose up --build -d
+
 ### 最近の更新
+#### 2025-11-13: YouTube PO Token対応完了 ⚠️ 重要
+
+**背景**:
+- YouTube側のPO Token認証導入により、全14会議で字幕取得が失敗
+- yt-dlp 2025.10.22では対応不可能と判明
+- 約4時間でVPS復旧完了
+
+**対応内容**:
+1. yt-dlpを2025.10.22 → 2025.11.12にアップデート
+2. Deno 2.5.6をインストール（PO Token自動生成に必要）
+3. ydl_opts設定をシンプル化（最新版は自動で最適化）
+4. cookieファイル検証
+
+**根本原因**:
+- YouTube側（60%）: 予期せぬPO Token要件の展開
+- システム側（40%）: 
+  - バージョン固定不足
+  - エラー監視・通知体制不足
+  - デバッグモード未整備
+
+**再発防止策**:
+- 依存関係のバージョン固定（requirements.txt）
+- 月次の依存ライブラリチェック
+- エラーログの詳細記録
+- DEBUG_MODE環境変数の追加
+
+**参考資料**:
+- [Perplexity調査結果](内部資料)
+- [yt-dlp PO Token Guide](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide)
+
+---
+
+#### 2025-11-13: VPS復旧完了（セキュリティインシデント）
+- サイバー攻撃からの復旧
+- fail2ban によるブロック機能確認
+- Nginx設定修正（port 3000へ）
+
+#### 2025-11-12: 監視会議拡大
+- 11会議 → 14会議（経産省8 + 金融庁6）
 - 2025-11-13: **VPS復旧完了**（サイバー攻撃からの復旧）
 - 2025-11-13: Nginx設定修正（port 3000へ）
 - 2025-11-12: 監視会議を11→14に拡大
 
 ---
+
+## ⚠️ 重要な注意事項
+
+### YouTube字幕取得について
+
+**重要**: YouTubeは2025年10月以降、PO Token（Proof of Origin）認証を段階的に導入しており、字幕取得には以下の要件が**必須**です：
+
+#### 必須要件
+1. **yt-dlp 2025.11.12以降**
+2. **Deno 2.5.6以降**（JavaScriptランタイム）
+3. **有効なcookieファイル**（YouTube認証用）
+
+これらが揃っていない場合、以下のエラーが発生します：
+- `No video formats found!`
+- `Requested format is not available`
+- `Sign in to confirm you're not a bot`
+
+#### 対応の背景（2025-11-13）
+
+**事象**:
+- 14会議すべてで字幕取得が突然失敗
+- YouTube側のPO Token要件により、既存の yt-dlp 2025.10.22 では対応不可
+
+**対応内容**:
+1. yt-dlpを2025.11.12にアップデート
+2. Denoをインストール（PO Token自動生成に必要）
+3. シンプルな設定に変更（最新版は自動最適化）
+
+**教訓**:
+- 外部API依存は必ず壊れる前提で設計する
+- 依存関係のバージョンを固定し、定期的にチェックする
+- エラーの詳細ログを常に記録する（本番環境でも）
+- デバッグモードを環境変数で切り替え可能にする
+
+#### 参考資料
+- [yt-dlp PO Token Guide](https://github.com/yt-dlp/yt-dlp/wiki/PO-Token-Guide)
+- [Issue #13075](https://github.com/yt-dlp/yt-dlp/issues/13075)
+- [PR #13234](https://github.com/yt-dlp/yt-dlp/pull/13234)
+
+---
+
 
 ## 🏛️ 監視対象会議
 
@@ -356,6 +478,7 @@ ARCHIVE_SHEET_ID = "your-archive-sheet-id"
 
 ### 4. VPS セットアップ
 
+#### 初期セットアップ
 ```bash
 # fetcher起動（PM2）
 cd /root/fetcher
@@ -370,6 +493,53 @@ docker-compose up -d
 sudo nano /etc/nginx/sites-enabled/default
 # port 3000を指定
 sudo systemctl reload nginx
+```
+
+#### ⚠️ Deno & yt-dlp セットアップ（重要）
+
+YouTube字幕取得に必須：
+```bash
+# 1. Denoインストール
+cd /tmp
+curl -fsSL https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip -o deno.zip
+apt install unzip
+unzip deno.zip
+docker cp deno asr_asr_1:/usr/local/bin/
+docker exec -it asr_asr_1 chmod +x /usr/local/bin/deno
+
+# 2. yt-dlp最新版にアップデート
+docker exec -it asr_asr_1 pip install -U yt-dlp --break-system-packages
+
+# 3. 確認
+docker exec -it asr_asr_1 deno --version  # 2.5.6以降
+docker exec -it asr_asr_1 pip show yt-dlp  # 2025.11.12以降
+
+# 4. cookieファイル配置
+# /root/asr/cookies.txt に配置（docker-compose.yml でマウント済み）
+
+# 5. 動作確認
+curl -X POST https://fetch.klammer.co.jp/asr/youtube-subs \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $VPS_FETCH_TOKEN" \
+  -d '{"url":"https://youtube.com/live/-pU-YnMDq8M"}'
+```
+
+#### Dockerfileへの反映（推奨）
+
+将来の再構築時のために、Dockerfileに追加：
+```dockerfile
+# /root/asr/Dockerfile に追加
+
+# Denoのインストール
+RUN apt-get update && apt-get install -y curl unzip && \
+    curl -fsSL https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip -o /tmp/deno.zip && \
+    unzip /tmp/deno.zip -d /usr/local/bin/ && \
+    chmod +x /usr/local/bin/deno && \
+    rm /tmp/deno.zip && \
+    apt-get clean
+
+# yt-dlpを最新版に固定
+RUN pip install yt-dlp==2025.11.12 --break-system-packages
 ```
 
 ### 5. トリガー設定
@@ -446,9 +616,108 @@ Gemini で要約生成
 ```
 
 #### 3. YouTube字幕が取得できない
+
+##### エラー: "No video formats found!"
+
+**原因**: YouTube PO Token認証に対応していない（yt-dlp バージョンが古い）
+
+**診断**:
+```bash
+# yt-dlpバージョン確認
+docker exec -it asr_asr_1 pip show yt-dlp
+
+# 期待値: 2025.11.12以降
 ```
-原因: 字幕が存在しない、またはyt-dlpエラー
-対応: ログ確認、手動字幕確認
+
+**解決策**:
+```bash
+# 1. yt-dlpを最新版に更新
+docker exec -it asr_asr_1 pip install -U yt-dlp --break-system-packages
+
+# 2. 再起動
+docker-compose restart
+
+# 3. テスト
+curl -X POST https://fetch.klammer.co.jp/asr/youtube-subs \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $VPS_FETCH_TOKEN" \
+  -d '{"url":"https://www.youtube.com/watch?v=test"}'
+```
+
+##### エラー: "Requested format is not available"
+
+**原因**: Denoがインストールされていない（PO Token生成に必要）
+
+**診断**:
+```bash
+# Deno確認
+docker exec -it asr_asr_1 deno --version
+
+# 期待値: deno 2.5.6以降
+```
+
+**解決策（Denoがない場合）**:
+```bash
+# VPS側で
+cd /tmp
+curl -fsSL https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip -o deno.zip
+apt install unzip  # 必要に応じて
+unzip deno.zip
+
+# コンテナにコピー
+docker cp deno asr_asr_1:/usr/local/bin/
+docker exec -it asr_asr_1 chmod +x /usr/local/bin/deno
+
+# 確認
+docker exec -it asr_asr_1 deno --version
+
+# 再起動
+docker-compose restart
+```
+
+##### エラー: "Sign in to confirm you're not a bot"
+
+**原因**: cookieファイルが期限切れまたは無効
+
+**診断**:
+```bash
+# cookie確認
+docker exec -it asr_asr_1 ls -la /app/cookies.txt
+docker exec -it asr_asr_1 grep LOGIN_INFO /app/cookies.txt
+```
+
+**解決策**:
+```bash
+# 1. ブラウザでYouTubeにログイン
+# 2. Chrome拡張「Get cookies.txt LOCALLY」で cookies.txt を取得
+# 3. VPSにアップロード
+scp cookies.txt root@your-vps:/root/asr/
+
+# 4. 再起動
+docker-compose restart
+```
+
+#### デバッグモード（詳細ログ確認）
+
+問題発生時、詳細なログを出力する方法：
+```bash
+# 1. docker-compose.yml 編集
+nano /root/asr/docker-compose.yml
+
+# environment に追加
+environment:
+  - DEBUG_MODE=true
+
+# 2. 再起動
+docker-compose restart
+
+# 3. ログをリアルタイム監視
+docker logs -f asr_asr_1
+
+# 4. テスト実行（別ターミナル）
+curl -X POST https://fetch.klammer.co.jp/asr/youtube-subs ...
+
+# 5. 問題解決後、DEBUG_MODE=false に戻す
 ```
 
 #### 4. Gemini APIエラー
