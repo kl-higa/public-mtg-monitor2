@@ -261,7 +261,13 @@ function dailyCheckAll() {
 
     // 新着処理
     for (const p of newcomers) {
-      const mt = scrapeMeetingPage_(p.url);
+      // 省庁によってスクレイピング方法を変える
+      let mt;
+      if (src.agency === '金融庁') {
+        mt = scrapeFsaMeetingPage_(p.url);
+      } else {
+        mt = scrapeMeetingPage_(p.url);
+      }
       
       if (!isMeetingPageLikelyValid_(mt)) {
         Logger.log('skip: page seems not yet published or invalid -> ' + p.url);
@@ -271,20 +277,72 @@ function dailyCheckAll() {
       const agendaPdf = mt.pdfs.find(x => x.isAgenda);
       const rosterPdf = mt.pdfs.find(x => x.isRoster);
 
-      // PDF OCR
+// PDF OCR
       let agendaText = '', rosterText = '';
       try { if (agendaPdf) agendaText = extractPdfTextViaVps_(agendaPdf.url); } catch (e) { Logger.log('OCR agenda error: ' + e); }
       try { if (rosterPdf) rosterText = extractPdfTextViaVps_(rosterPdf.url); } catch (e) { Logger.log('OCR roster error: ' + e); }
       
-      // 字幕取得（VPS優先）
+      // 字幕/議事要旨取得
       let transcript = '';
       let transcriptSource = 'なし';
-      if (mt.youtube) {
-        const r = fetchSubsViaVps_(mt.youtube);
-        transcript = r.text || '';
-        transcriptSource = r.source || 'なし';
-      }
       
+      if (src.agency === '金融庁') {
+        // 金融庁: URLで判定
+        if (p.url.includes('/gijiyoshi/') || p.url.includes('/gijiroku/')) {
+          // 議事要旨ページ → 要約生成
+          Logger.log('[金融庁] 議事要旨ページ検知 → 要約生成');
+          
+          const gijiyoshiHtml = fetchText_(p.url);
+          if (gijiyoshiHtml) {
+            transcript = extractGijiyoshiTextFromHtml_(gijiyoshiHtml);
+            transcriptSource = '議事要旨HTML';
+            Logger.log(`[金融庁] 議事要旨抽出: ${transcript.length}文字`);
+            
+            // 資料ページURLを推測して議事次第を取得
+            const shiryoUrl = p.url.replace('/gijiyoshi/', '/shiryou/')
+                                   .replace('/gijiroku/', '/gijishidai/');
+            
+            Logger.log(`[金融庁] 資料ページURL（推測）: ${shiryoUrl}`);
+            
+            const shiryoHtml = fetchText_(shiryoUrl);
+            if (shiryoHtml) {
+              const shiryoMt = scrapeFsaMeetingPage_(shiryoUrl);
+              const shiryoAgendaPdf = shiryoMt.pdfs.find(x => x.isAgenda);
+              const shiryoRosterPdf = shiryoMt.pdfs.find(x => x.isRoster);
+              
+              if (shiryoAgendaPdf && !agendaText) {
+                try { 
+                  agendaText = extractPdfTextViaVps_(shiryoAgendaPdf.url); 
+                  Logger.log(`[金融庁] 資料ページから議事次第取得: ${agendaText.length}文字`);
+                } catch (e) { 
+                  Logger.log('OCR agenda error: ' + e); 
+                }
+              }
+              
+              if (shiryoRosterPdf && !rosterText) {
+                try { 
+                  rosterText = extractPdfTextViaVps_(shiryoRosterPdf.url); 
+                  Logger.log(`[金融庁] 資料ページから委員名簿取得: ${rosterText.length}文字`);
+                } catch (e) { 
+                  Logger.log('OCR roster error: ' + e); 
+                }
+              }
+            }
+          }
+        } else {
+          // 議事次第ページ → 通知のみ
+          Logger.log('[金融庁] 議事次第ページ検知 → 通知のみ');
+          transcriptSource = 'なし（議事要旨未公開）';
+        }
+      } else {
+        // 経産省: YouTube字幕取得（VPS優先）
+        if (mt.youtube) {
+          const r = fetchSubsViaVps_(mt.youtube);
+          transcript = r.text || '';
+          transcriptSource = r.source || 'なし';
+        }
+      }
+        
       transcript = cleanTranscript_(transcript);
 
       // 要約生成
@@ -494,7 +552,11 @@ function fetchText_(url) {
 }
 
 function fetchViaVps_(url) {
-  if (!CONFIG.SUBS.BASE_URL || !CONFIG.SUBS.TOKEN) {
+  const props = PropertiesService.getScriptProperties();
+  const baseUrl = props.getProperty('VPS_FETCH_BASE');
+  const token = props.getProperty('VPS_FETCH_TOKEN');
+  
+  if (!baseUrl || !token) {
     Logger.log('[fetchViaVps_] VPS設定なし、直接取得へ');
     try {
       return UrlFetchApp.fetch(url, { muteHttpExceptions: true }).getContentText();
@@ -505,12 +567,11 @@ function fetchViaVps_(url) {
   }
 
   try {
-    // GET リクエスト + クエリパラメータ方式
-    const fetcherUrl = CONFIG.SUBS.BASE_URL + '/fetcher/crawl?url=' + encodeURIComponent(url);
+    const fetcherUrl = baseUrl + '/fetcher/crawl?url=' + encodeURIComponent(url);
     
     const res = UrlFetchApp.fetch(fetcherUrl, {
       muteHttpExceptions: true,
-      headers: { 'Authorization': 'Bearer ' + CONFIG.SUBS.TOKEN }
+      headers: { 'Authorization': 'Bearer ' + token }
     });
     
     const code = res.getResponseCode();
@@ -556,11 +617,13 @@ function extractFsaMeetingPages_(html, baseDir) {
   const pages = [];
   
   // 金融庁は複数のディレクトリパターンがある
-  // siryou/, shiryou/, gijishidai/
+  // siryo/, siryou/, shiryou/, gijishidai/, gijiroku/
   const patterns = [
-    /href="([^"]*\/siryou\/(\d{8})\.html)"/gi,
-    /href="([^"]*\/shiryou\/(\d{8})\.html)"/gi,
-    /href="([^"]*\/gijishidai\/(\d{8})\.html)"/gi
+    /href="([^"]*\/siryo\/(\d{8})\.html)"/gi,      // siryo（rが1つ）
+    /href="([^"]*\/siryou\/(\d{8})\.html)"/gi,     // siryou
+    /href="([^"]*\/shiryou\/(\d{8})\.html)"/gi,    // shiryou
+    /href="([^"]*\/gijishidai\/(\d{8})\.html)"/gi, // gijishidai
+    /href="([^"]*\/gijiroku\/(\d{8})\.html)"/gi    // gijiroku
   ];
   
   for (const pattern of patterns) {
@@ -727,14 +790,16 @@ function scrapeFsaMeetingPage_(url) {
   const titleMatch = html.match(/<title[^>]*?>(.*?)<\/title>/i);
   if (titleMatch) mt.title = titleMatch[1].replace(/<[^>]+>/g, '').trim();
 
-  // 日付抽出（全角・半角両対応）
-  const reiwaLiMatch = html.match(/<li[^>]*?>日時[：:]\s*令和([0-9０-９]+)年([0-9０-９]+)月([0-9０-９]+)日/i);
-  if (reiwaLiMatch) {
-    const reiwaYear = normalizeNum_(reiwaLiMatch[1]);
-    const month = normalizeNum_(reiwaLiMatch[2]);
-    const day = normalizeNum_(reiwaLiMatch[3]);
+  // 日付抽出（複数パターン対応）
+  // まず、HTMLから令和表記を探す（最もシンプル）
+  const reiwaSimple = html.match(/令和([0-9０-９]+)年([0-9０-９]+)月([0-9０-９]+)日/);
+  if (reiwaSimple) {
+    const reiwaYear = normalizeNum_(reiwaSimple[1]);
+    const month = normalizeNum_(reiwaSimple[2]);
+    const day = normalizeNum_(reiwaSimple[3]);
     const seirekiYear = 2018 + reiwaYear;
     mt.date = `${seirekiYear}年${month}月${day}日`;
+    Logger.log(`[DEBUG] 令和表記から日付抽出: ${mt.date}`);
   }
   
   // フォールバック: URLから抽出
@@ -746,6 +811,7 @@ function scrapeFsaMeetingPage_(url) {
       const month = parseInt(dateStr.substring(4, 6));
       const day = parseInt(dateStr.substring(6, 8));
       mt.date = `${year}年${month}月${day}日`;
+      Logger.log(`[DEBUG] URLから日付抽出: ${mt.date}`);
     }
   }
 
@@ -914,7 +980,182 @@ function summarizeMeeting_(meeting, agendaText, rosterText, transcriptText) {
   const key = PropertiesService.getScriptProperties().getProperty(CONFIG.GEMINI.API_KEY_PROP);
   if (!key) return '';
 
-  // チャンク分割
+// 案A: 短い場合は全文を直接要約
+  if (transcriptText.length <= 30000) {
+    Logger.log(`[sum] 全文直接要約モード: ${transcriptText.length}文字`);
+    
+    // 議題抽出（優先順位付き）
+    const agendaSmart = extractAgendaSmartFromGijishidai_(agendaText || '');
+    let agendaBlock = '';
+    
+    if (agendaSmart.success) {
+      agendaBlock = agendaSmart.block;
+      Logger.log('[DEBUG] 議題を議事次第PDFから抽出');
+    } else {
+      // 議事要旨HTMLから抽出
+      const fromGijiyoshi = extractAgendaFromGijiyoshiHtml_(transcriptText);
+      if (fromGijiyoshi.success) {
+        agendaBlock = fromGijiyoshi.block;
+        Logger.log('[DEBUG] 議題を議事要旨HTMLから抽出');
+      } else {
+        // 最終フォールバック: タイトルから推測
+        agendaBlock = fallbackAgendaFromTitleOrPdfs_(meeting) || '1. 会議全体の議論';
+        Logger.log('[DEBUG] フォールバック議題使用');
+      }
+    }
+    
+    // 全文を直接投入
+    const formatSpec = `
+    # 役割
+    あなたは日本の行政会議の議事要旨編集者。以下の資料を統合し、決められたフォーマットで日本語要約を作成する。
+
+    # 正規議題
+    ${agendaBlock}
+
+    # 議題の表示ルール（金融庁特有）
+    「■議題」セクションには、階層議題をそのまま表示：
+    ${agendaBlock}
+
+    「■議題別要約」の番号付けルール：
+    - 親議題（インデントなし）: 1, 2, 3... と番号を振る
+    - 子議題（インデント付き「- 」で始まる）: 親議題内で (1), (2) のサブ番号を使う
+    - 親議題に子がある場合、親議題の要約は書かず、すぐに子議題の要約を始める
+
+    # 重要：議題と配付資料の区別
+    - 議事次第の「議事」セクション（開会、プレゼン、パネル討論など）のみを「■議題」に記載
+    - 配付資料リストは「■議題」に含めない
+
+    # 議題別要約の絶対ルール
+    - 正規議題に記載された全ての議題について、必ず個別に要約を記載すること
+    - 議題が関連していても統合禁止。各議題ごとに独立して記載
+    - 各議題には必ず具体的な内容を箇条書きで2項目以上記載
+    - 各議題の間は必ず空行を1行入れること
+    - 議題タイトルの後も1行空けること
+
+    # 量的制約（絶対厳守）
+    ⚠️ 全体で2500文字を1文字でも超えたら不合格。
+
+    【セクション別文字数上限】
+    - 開催概要：150文字以内
+    - サマリ：150文字以内（必ず3行、各40-50文字）
+    - 議題別要約：全議題合計で1800文字以内
+      * 各議題の全体：最大300文字
+      * 各議題の内容箇条書き：最大3項目（各30文字以内）
+      * 各議題の委員コメント：最大2名（各40文字以内）
+      * 各議題の事務局対応：1項目のみ（40文字以内）
+    - 座長まとめ：80文字以内
+
+    【簡潔化の徹底】
+    ❌ 削除すべき表現：
+    「〜について」「〜に関して」「〜が説明された」「〜が示された」「〜とされた」
+    「喫緊の課題」「重要である」「必要である」などの形容・評価
+
+    ✅ 簡潔化の例：
+    悪い：「金融機関のAI活用においてデータ整備が大きな課題と認識された。」（32文字）
+    良い：「金融機関のAI活用でデータ整備が課題。」（20文字）
+
+    悪い：「江見委員：生成AIで非構造データ活用が拡大しており重要である。」（32文字）
+    良い：「江見委員：生成AIで非構造データ活用が拡大。」（22文字）
+
+    # 委員名の抽出ルール（重要）
+    - 議事要旨に記載された実名をそのまま使用
+    - 「委員A」「委員B」などの仮名は絶対に使用禁止
+    - 例：「岩下委員」「永沢委員」「江見委員」など
+    - 委員名が不明の場合のみ「ある委員」と記載
+
+    # 厳守する出力フォーマット
+    - 章見出しは必ず「■」で開始
+    - 議題番号は太字なし（プレーンテキスト）
+      ※HTMLメール変換時に自動で太字化されるため
+    - 委員名・所属は実名を使用。不明は「（未記載）」で明示
+    - マークダウン記法（**太字**など）は一切使用禁止
+    - 指示文言（「150文字以内」など）は出力に含めない
+
+    # 重要な書式ルール
+    - 議題内容の箇条書きは「・」（中黒）で開始
+    - 委員コメント部分の前には必ず空行を1行入れる
+    - 委員コメントは「・委員名：内容」の形式
+    - 委員コメントと事務局対応の間には空行を入れない
+    - 議題番号は「1.」「2.」（半角数字 + 半角ピリオド）
+    - サブ議題番号は「(1)」「(2)」（半角括弧 + 半角数字）
+    - 罫線は全角40文字分の長さで統一
+    - 議題タイトルと内容の間は改行のみ（空行なし）
+
+    # 出力テンプレート
+    ■${meeting.title}（${meeting.date || '日付未記載'}）
+    ────────────────────────────
+    ■開催概要
+    ・日時：${meeting.date || '（記載なし）'}
+    ・形式：（オンライン／現地／ハイブリッド）
+    ・出席者：座長名、委員名（3-5名を代表的に）、オブザーバー、事務局
+    ────────────────────────────
+    ■議題
+    ${agendaBlock}
+    ────────────────────────────
+    ■サマリ
+    ・（要点1）
+    ・（要点2）
+    ・（要点3）
+    ────────────────────────────
+    ■議題別要約
+    1.（議題タイトル）
+    要点：
+    ・（要点1）
+    ・（要点2）
+    ・（要点3）
+    委員コメント：
+    ・委員名：（意見内容）
+    ・委員名：（意見内容）
+    事務局対応：
+    ・（対応内容）
+
+    2.（議題タイトル）
+
+    (1)（サブ議題タイトル）
+    要点：
+    ・（要点1）
+    ・（要点2）
+    委員コメント：
+    ・委員名：（意見内容）
+    事務局対応：
+    ・（対応内容）
+
+    (2)（サブ議題タイトル）
+    ...
+
+    ────────────────────────────
+    ■座長まとめ（座長名）
+    ・（総括と方向性）
+    ────────────────────────────
+
+    # 入力資料
+    - 議事次第：
+    ${(agendaText || '').slice(0, 8000) || '（未取得）'}
+
+    - 委員名簿：
+    ${(rosterText || '').slice(0, 8000) || '（未取得）'}
+
+    - 議事要旨全文：
+    ${transcriptText}
+    `;
+
+    let final = callGeminiWithRetry_(key, CONFIG.GEMINI.MODEL, formatSpec) || '';
+    Logger.log('[sum] 全文直接要約完了 len=' + final.length);
+    
+    // 2500文字制限
+    if (final.length > 2500) {
+      Logger.log(`⚠️ 文字数超過: ${final.length}文字 → 強制削減実行`);
+      final = forceReduceSummary_(final, 2500);
+    }
+    
+    final = final.replace(/────+\s*$/, '').trim();
+    final = final.replace(/\*\*/g, '').replace(/\*/g, '');
+    
+    return final.trim();
+  }
+  // ★★★ ここまで追加 ★★★
+
+  // 既存のチャンク処理（3万文字超の場合）
   const chunkMax = CONFIG.GEMINI.MAX_CHARS_PER_CHUNK || 50000;
   const chunks = chunkText_(transcriptText, chunkMax);
   Logger.log(`[sum] transcript_len=${transcriptText.length}, chunks=${chunks.length}, chunkMax=${chunkMax}`);
@@ -942,105 +1183,138 @@ function summarizeMeeting_(meeting, agendaText, rosterText, transcriptText) {
   const agendaBlock = agendaStrict.block || agendaFromText.block || '（議題未検出：議事次第PDFをご確認ください）';
 
   // 最終整形
+  // 議題抽出（金融庁も対応）
+  const agendaSmart = extractAgendaSmartFromGijishidai_(agendaText || '');
+  let finalAgendaBlock = '';
+  
+  if (agendaSmart.success) {
+    finalAgendaBlock = agendaSmart.block;
+    Logger.log('[DEBUG] チャンク分割: 議題を議事次第PDFから抽出');
+  } else {
+    // 金融庁の場合は議事要旨HTMLから抽出
+    const fromGijiyoshi = extractAgendaFromGijiyoshiHtml_(transcriptText);
+    if (fromGijiyoshi.success) {
+      finalAgendaBlock = fromGijiyoshi.block;
+      Logger.log('[DEBUG] チャンク分割: 議題を議事要旨HTMLから抽出');
+    } else {
+      finalAgendaBlock = fallbackAgendaFromTitleOrPdfs_(meeting) || '1. 会議全体の議論';
+      Logger.log('[DEBUG] チャンク分割: フォールバック議題使用');
+    }
+  }
+  
   const formatSpec = `
-# 役割
-あなたは「日本の行政会議（経産省 検討会等）の要約専門家」。
+  # 役割
+  あなたは日本の行政会議の議事要旨編集者。以下のチャンク要約を統合し、決められたフォーマットで日本語要約を作成する。
 
-# 正規議題（議事次第PDFから抽出）
-${agendaStrict.block || '(未検出)'}
+  # 正規議題
+  ${finalAgendaBlock}
 
-# 重要：議題と配付資料の区別
-- 議事次第PDFの「3. 議事」または「議事」セクション（開会、ヒアリング、閉会など）のみを「■議題」に記載
-- 「4. 配付資料」や資料リスト（資料1、資料2など）は「■議題」に含めない
-- 配付資料情報は別セクションで提供されるため省略
+  # 重要：議題と配付資料の区別
+  - 議事次第PDFの「3. 議事」または「議事」セクション（開会、ヒアリング、閉会など）のみを「■議題」に記載
+  - 「4. 配付資料」や資料リスト（資料1、資料2など）は「■議題」に含めない
+  - 配付資料情報は別セクションで提供されるため省略
 
-# 議題別要約の絶対ルール
-- 正規議題に記載された全ての議題について、必ず個別に要約を記載すること
-- 議題が関連していても統合禁止。各議題ごとに独立して記載すること
-- 議題内容が薄い場合でも「・事務局から○○について説明」など最低1項目は記載すること
-- 議題タイトルだけで内容が空の行は生成禁止
-- 各議題には必ず具体的な内容を箇条書きで2項目以上記載すること
+  # 議題別要約の絶対ルール
+  - 正規議題に記載された全ての議題について、必ず個別に要約を記載すること
+  - 議題が関連していても統合禁止。各議題ごとに独立して記載すること
+  - 議題内容が薄い場合でも「・事務局から○○について説明」など最低1項目は記載すること
+  - 議題タイトルだけで内容が空の行は生成禁止
+  - 各議題には必ず具体的な内容を箇条書きで2項目以上記載すること
+  - 各議題の間は必ず空行を1行入れること
 
-# 量的制約（絶対厳守・違反は不合格）
-⚠️ 全体で2500文字を1文字でも超えたら不合格。必ず以下の上限を守ること。
+  # 量的制約（絶対厳守・違反は不合格）
+  ⚠️ 全体で2500文字を1文字でも超えたら不合格。必ず以下の上限を守ること。
 
-【セクション別文字数上限】
-- ■開催概要：150文字以内
-- ■サマリ：150文字以内（必ず3行、各40-50文字）
-- ■議題別要約：全議題合計で1800文字以内
-  * 各議題の全体：最大300文字
-  * 各議題の内容箇条書き：最大3項目（各30文字以内）
-  * 各議題の委員コメント：最大2名（各40文字以内）
-  * 各議題の事務局対応：1項目のみ（40文字以内）
-- ■座長まとめ：80文字以内
+  【セクション別文字数上限】
+  - ■開催概要：150文字以内
+  - ■サマリ：150文字以内（必ず3行、各40-50文字）
+  - ■議題別要約：全議題合計で1800文字以内
+    * 各議題の全体：最大300文字
+    * 各議題の内容箇条書き：最大3項目（各30文字以内）
+    * 各議題の委員コメント：最大2名（各40文字以内）
+    * 各議題の事務局対応：1項目のみ（40文字以内）
+  - ■座長まとめ：80文字以内
 
-※出力時に（）や【】などの指示記号は使用せず、実際の内容のみを記載すること
+  ※出力時に（）や【】などの指示記号は使用せず、実際の内容のみを記載すること
 
-【簡潔化の徹底】
-❌ 削除すべき表現：
-「〜について」「〜に関して」「〜が説明された」「〜が示された」「〜とされた」
-「喫緊の課題」「重要である」「必要である」などの形容・評価
+  【簡潔化の徹底】
+  ❌ 削除すべき表現：
+  「〜について」「〜に関して」「〜が説明された」「〜が示された」「〜とされた」
+  「喫緊の課題」「重要である」「必要である」などの形容・評価
 
-✅ 簡潔化の例：
-悪い：「2030年までの電源移行期における安定供給確保が喫緊の課題とされた。」（38文字）
-良い：「2030年まで安定供給確保が課題。」（18文字）
+  ✅ 簡潔化の例：
+  悪い：「2030年までの電源移行期における安定供給確保が喫緊の課題とされた。」（38文字）
+  良い：「2030年まで安定供給確保が課題。」（18文字）
 
-悪い：「秋本委員：民間事業への国介入は慎重に。発電設備閉鎖には地元調整が必要。」（40文字）
-良い：「秋本委員：国介入は慎重に、地元調整必要。」（22文字）
+  悪い：「秋本委員：民間事業への国介入は慎重に。発電設備閉鎖には地元調整が必要。」（40文字）
+  良い：「秋本委員：国介入は慎重に、地元調整必要。」（22文字）
 
-# 厳守する出力フォーマット
-- 章見出しは必ず「■」で開始。罫線・順序は厳密に守る。文末は常体。敬称は省略。
-- 委員名・所属は名簿に準拠（文字起こし側の誤記をそのまま使わない）。
-- 不明は「（未記載）」で明示。捏造禁止。
-- マークダウン記法（**太字**など）は一切使用禁止。すべて平文。
+  # 厳守する出力フォーマット
+  - 章見出しは必ず「■」で開始。罫線・順序は厳密に守る。文末は常体。敬称は省略。
+  - 議題番号は太字なし（プレーンテキスト）
+    ※HTMLメール変換時に自動で太字化されるため
+  - 委員名・所属は名簿に準拠（文字起こし側の誤記をそのまま使わない）。
+  - 不明は「（未記載）」で明示。捏造禁止。
+  - マークダウン記法（**太字**など）は一切使用禁止。すべて平文。
 
-# 出力テンプレート
-■${meeting.title}（${meeting.date || '日付未記載'}）
-────────────────────────────
-■開催概要（150文字以内）
-・日時：${meeting.date || '（記載なし）'}
-・形式：（オンライン／現地／ハイブリッド）
-・出席者：座長名、委員名（3-5名を代表的に）、オブザーバー、事務局
-────────────────────────────
-■議題
-${agendaBlock}
-────────────────────────────
-■サマリ（150文字以内、必ず3行）
-・（要点1）
-・（要点2）
-・（要点3）
-────────────────────────────
-■議題別要約（全体で1800文字以内）
+  # 重要な書式ルール
+  - 議題内容の箇条書きは「・」（中黒）で開始
+  - 議題内容の最後の箇条書きと委員コメントの間に空行を1行入れる
+  - 委員コメントは「・委員名：内容」の形式
+  - 委員コメントと事務局対応の間には空行を入れない
+  - 委員コメントや事務局対応がない場合は「特になし」と記載
+  - 議題番号は「1.」「2.」（半角数字 + 半角ピリオド）
+  - 罫線は全角40文字分の長さで統一
+  - 議題タイトルと内容の間は改行のみ（空行なし）
 
-1.（議題タイトル）
-・（要点1）
-・（要点2）
-・（要点3）
+  # 出力テンプレート
+  ■${meeting.title}（${meeting.date || '日付未記載'}）
+  ────────────────────────────
+  ■開催概要
+  ・日時：${meeting.date || '（記載なし）'}
+  ・形式：（オンライン／現地／ハイブリッド）
+  ・出席者：座長名、委員名（3-5名を代表的に）、オブザーバー、事務局
+  ────────────────────────────
+  ■議題
+  ${agendaBlock}
+  ────────────────────────────
+  ■サマリ
+  ・（要点1）
+  ・（要点2）
+  ・（要点3）
+  ────────────────────────────
+  ■議題別要約
 
-・委員A：（意見内容）
-・委員B：（意見内容）
-・事務局対応：（対応内容）
+  1.（議題タイトル）
+  要点：
+  ・（要点1）
+  ・（要点2）
+  ・（要点3）
+  委員コメント：
+  ・委員A：（意見内容）
+  ・委員B：（意見内容）
+  事務局対応：
+  ・（対応内容）
 
-2.（議題タイトル）
-...（同様の形式）
+  2.（議題タイトル）
 
-────────────────────────────
-■座長まとめ（座長名）（80文字以内）
-・（総括と方向性）
-────────────────────────────
+  ...（同様の形式）
 
-# 重要な書式ルール
-- 議題内容の箇条書きは「・」（中黒）で開始
-- 委員コメント部分の前には必ず空行を1行入れる
-- 委員コメントは「・委員名：内容」の形式
-- 議題番号は「1.」「2.」（半角数字 + 半角ピリオド）
-- 罫線の長さは統一（全角20文字分）
+  ────────────────────────────
+  ■座長まとめ（座長名）
+  ・（総括と方向性）
+  ────────────────────────────
 
-# 入力資料
-- 議事次第：\n${(agendaText || '').slice(0, 8000) || '（未取得）'}
-- 委員名簿：\n${(rosterText || '').slice(0, 8000) || '（未取得）'}
-- チャンク要約：\n${merged}
-`;
+  # 入力資料
+  - 議事次第：
+  ${(agendaText || '').slice(0, 8000) || '（未取得）'}
+
+  - 委員名簿：
+  ${(rosterText || '').slice(0, 8000) || '（未取得）'}
+
+  - チャンク要約：
+  ${merged}
+  `;
 
   let final = callGemini_(key, CONFIG.GEMINI.MODEL, formatSpec) || '';
   Logger.log('[sum] final len=' + final.length);
@@ -1334,70 +1608,92 @@ function buildMailWithSummary_(meeting, finalSummaryText, linksBlock, sourceTagO
 
   const fallbackNote = REPORT
     ? '※本メールは「資料公開（取りまとめ等）」の検知です。会議開催・動画配信は確認できないため、文字起こし・要約は行いません。PDF本文をご確認ください。'
-    : (!mt.youtube && meeting.pageUrl.includes('fsa.go.jp')
+    : (!meeting.youtube && meeting.pageUrl.includes('fsa.go.jp')
         ? '※金融庁会議です。YouTube動画がないため資料公開の通知のみとなります。議事要旨公開後（1-2ヶ月後）に要約を配信予定です。'
         : '');
-    
-  const fallbackPlain = `■${meeting.title}
-────────────────────────────
-■開催概要
-・日時：${meeting.date || '（記載なし）'}
-・形式：記載なし
-・出席者：委員名簿：${'(リンクは本文末)'}
-────────────────────────────
-■議題
-${agendaBlockOverride || '（議題未検出：議事次第PDFの取得/OCRに失敗）'}
-${REPORT ? '' : '────────────────────────────\n■座長まとめ\n・（未記載）'}
-${REPORT ? '' : '\n（文字起こし取得後にサマリを再送します）'}
-${fallbackNote ? '\n\n' + fallbackNote : ''}`;
 
-  const summaryPlain = (finalSummaryText && finalSummaryText.trim()) ? cleanSummaryText_(finalSummaryText.trim()) : fallbackPlain;
-
-  const linksBlockFormatted = linksBlock 
-    ? linksBlock.split('\n').map(line => line.trim()).filter(Boolean).join('\n')
-    : '';
-
-  const baseLinks = `■リンク
-・会議ページ：${meeting.pageUrl}
-${meeting.youtube ? `・動画：${meeting.youtube}` : ''}
-${linksBlockFormatted}`;
-
-  // プレーンテキスト用のdisclaimer
-  const disclaimerPlain = `
-本内容はAIにより作成しているため元動画・資料での最終確認をお願いいたします。本サービスはβ版のため随時アップデートしているとともに予告なく終了する場合があります。ご要望や監視対象の会議追加については、info@klammer.co.jpまでご連絡ください。`;
-
-  const plain = summaryPlain.replace(/────+\s*$/, '').trim() + '\n\n' + baseLinks + '\n' + disclaimerPlain;
-
-  // HTML整形
-  const preheader = extractPreheaderOneLine_(summaryPlain) || `${meeting.title} の要約`;
-  const htmlMain = renderHtmlFromSummaryPlain_(summaryPlain);
+  // 罫線を統一
+  const divider = '────────────────────────────';
   
-  const htmlLinks = `
-    <div style="margin-top:20px; font-size:14px; color:#111;">
-      <strong>■リンク</strong><br>
-      ${autoLinkHtml_(escapeHtml_(baseLinks.replace('■リンク\n', ''))).replace(/\n/g, '<br>')}
-    </div>`;
-  
-  const disclaimer = `<p style="margin-top:16px; font-size:12px; color:#666;">
-    本内容はAIにより作成しているため元動画・資料での最終確認をお願いいたします。本サービスはβ版のため随時アップデートしているとともに予告なく終了する場合があります。ご要望や監視対象の会議追加については、info@klammer.co.jpまでご連絡ください。
-  </p>`;
+  // リンク部分（会議ページのみ）
+  const linksSection = `■リンク\n・会議ページ：${meeting.pageUrl}`;
 
-  const htmlBody =
-      '<div style="font-family:system-ui,Meiryo,Segoe UI,Roboto,sans-serif; line-height:1.7; color:#111;">' +
-        `<div style="font-size:0;opacity:0;height:0;line-height:0;display:none;visibility:hidden;">${escapeHtml_(preheader)}</div>` +
-        htmlMain + '<hr style="margin:20px 0;border:none;border-top:1px solid #e5e7eb;">' +
-        htmlLinks + disclaimer +
-      '</div>';
-
-  const baseTag = (finalSummaryText && finalSummaryText.trim())
-    ? '会議要約'
-    : (REPORT ? 'レポート' : '会議検知');
-
-  const displayTitle = meeting.title.length > 50 
-    ? meeting.title.substring(0, 50) + '...'
-    : meeting.title;
+  // 要約がある場合は要約のみ（要約内にタイトル・開催概要・議題が含まれている）
+  if (finalSummaryText) {
+    const plain = `${finalSummaryText}\n${divider}\n${linksSection}`;
+    const subject = `[会議要約] ${meeting.title}（${meeting.date || '日付未記載'}）`;
     
-  const subject = `[${baseTag}] ${displayTitle}（${meeting.date || '日付未記載'}）`;
+    // 見出しを太字に変換
+    const boldHeaders = (text) => {
+      return text
+        .replace(/^(■[^\n]+)/gm, '<strong>$1</strong>')
+        .replace(/^(\d+\.\s*[^\n]+)/gm, '<strong>$1</strong>')
+        .replace(/^(\(\d+\)\s*[^\n]+)/gm, '<strong>$1</strong>');
+    };
+    
+    let htmlBody = `
+<div style="font-family:sans-serif;line-height:1.6;color:#333;max-width:800px;">
+${boldHeaders(finalSummaryText).replace(/\n/g, '<br>')}
+<p style="border-bottom:1px solid #ccc;margin:12px 0;"></p>
+${boldHeaders(linksSection).replace(/\n/g, '<br>')}
+</div>
+`;
+    
+    htmlBody = htmlBody.replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" style="color:#0066cc;">$1</a>');
+    
+    return { subject, plain, htmlBody };
+  }
+  
+  // 要約がない場合は従来通り
+  const titleLine = `■${meeting.title}（${meeting.date || '日付未記載'}）`;
+  
+  const openingBlock = `■開催概要\n・日時：${meeting.date || '（記載なし）'}\n・形式：${meeting.format || '記載なし'}\n・出席者：${meeting.roster || '委員名簿：(リンクは本文末)'}`;
+
+  const agendaBlock = agendaBlockOverride
+    ? `■議題\n${agendaBlockOverride}`
+    : (topics ? `■議題\n${topics}` : '■議題\n（議題未検出）');
+
+  const summaryOrNote = (REPORT ? '' : '（文字起こし取得後にサマリを再送します）') + (fallbackNote ? '\n' + fallbackNote : '');
+
+  const plainParts = [
+    titleLine,
+    divider,
+    openingBlock,
+    divider,
+    agendaBlock,
+    divider,
+    summaryOrNote,
+    divider,
+    linksSection
+  ];
+
+  const plain = plainParts.filter(Boolean).join('\n');
+  const subject = `[会議検知] ${meeting.title}（${meeting.date || '日付未記載'}）`;
+
+  const htmlTitleLine = `<p style="font-size:16px;font-weight:bold;margin-bottom:8px;">${titleLine}</p>`;
+  
+  const boldHeaders = (text) => {
+    return text
+      .replace(/^(■[^\n]+)/gm, '<strong>$1</strong>')
+      .replace(/^(\d+\.\s*[^\n]+)/gm, '<strong>$1</strong>')
+      .replace(/^(\(\d+\)\s*[^\n]+)/gm, '<strong>$1</strong>');
+  };
+
+  let htmlBody = `
+<div style="font-family:sans-serif;line-height:1.6;color:#333;max-width:800px;">
+${htmlTitleLine}
+<p style="border-bottom:1px solid #ccc;margin:12px 0;"></p>
+${boldHeaders(openingBlock).replace(/\n/g, '<br>')}
+<p style="border-bottom:1px solid #ccc;margin:12px 0;"></p>
+${boldHeaders(agendaBlock).replace(/\n/g, '<br>')}
+<p style="border-bottom:1px solid #ccc;margin:12px 0;"></p>
+${boldHeaders(summaryOrNote).replace(/\n/g, '<br>')}
+<p style="border-bottom:1px solid #ccc;margin:12px 0;"></p>
+${boldHeaders(linksSection).replace(/\n/g, '<br>')}
+</div>
+`;
+
+  htmlBody = htmlBody.replace(/(https?:\/\/[^\s<]+)/g, '<a href="$1" style="color:#0066cc;">$1</a>');
 
   return { subject, plain, htmlBody };
 }
@@ -1681,6 +1977,270 @@ function normalizeNum_(s) {
   return parseInt(String(s).replace(/[０-９]/g, c => String.fromCharCode(c.charCodeAt(0) - 0xFEE0)), 10);
 }
 
+/**
+ * HTMLから議事要旨テキストを抽出（構造保持版）
+ */
+function extractGijiyoshiTextFromHtml_(html) {
+  if (!html) return '';
+  
+  // メインコンテンツを抽出
+  let mainContent = '';
+  
+  const mainMatch = html.match(/<div[^>]*id="main"[^>]*>([\s\S]*?)<\/div>\s*<\/div>/i);
+  if (mainMatch) {
+    mainContent = mainMatch[1];
+  } else {
+    mainContent = html;
+  }
+  
+  // 見出しを保持しながらHTMLタグを処理
+  let text = mainContent
+    .replace(/<script[^>]*?>[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[^>]*?>[\s\S]*?<\/style>/gi, '')
+    // 見出しタグを明示的に変換
+    .replace(/<h1[^>]*?>(.*?)<\/h1>/gi, '\n\n【見出し1】$1\n')
+    .replace(/<h2[^>]*?>(.*?)<\/h2>/gi, '\n\n【見出し2】$1\n')
+    .replace(/<h3[^>]*?>(.*?)<\/h3>/gi, '\n\n【見出し3】$1\n')
+    .replace(/<h4[^>]*?>(.*?)<\/h4>/gi, '\n\n【見出し4】$1\n')
+    // リストアイテム
+    .replace(/<li[^>]*?>(.*?)<\/li>/gi, '\n・$1')
+    // 段落
+    .replace(/<p[^>]*?>(.*?)<\/p>/gi, '$1\n')
+    // 改行
+    .replace(/<br[^>]*?>/gi, '\n')
+    // その他のタグを削除
+    .replace(/<[^>]+>/g, ' ')
+    // 特殊文字変換
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    // 空白整理
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n\s+/g, '\n')
+    .replace(/\n\n\n+/g, '\n\n')
+    .trim();
+  
+  return text;
+}
+
+/**
+ * 議事要旨HTMLから議題を抽出（階層版）
+ */
+function extractAgendaFromGijiyoshiHtml_(htmlText) {
+  if (!htmlText) return { success: false, block: '' };
+  
+  // パターン1: 「議事」見出しがある場合
+  const patterns = [
+    /【見出し\d】議事\n([\s\S]*?)(?:\n【見出し\d】|$)/,
+    /【見出し\d】議題\n([\s\S]*?)(?:\n【見出し\d】|$)/,
+  ];
+  
+  for (const pattern of patterns) {
+    const match = htmlText.match(pattern);
+    if (match) {
+      let agendaText = match[1].trim();
+      
+      // 「開会」「閉会」を除外
+      const lines = agendaText.split('\n')
+        .map(line => line.trim())
+        .filter(line => line.length > 0)
+        .filter(line => !line.match(/^・?(開会|閉会)$/));
+      
+      if (lines.length > 0) {
+        const normalized = lines.map((line, i) => {
+          if (line.match(/^[0-9０-９]+[\.．]/)) {
+            return line.replace(/^[0-9０-９]+[\.．]\s*/, (m) => {
+              const num = m.match(/[0-9０-９]+/)[0];
+              const n = normalizeNum_(num);
+              return `${n}. `;
+            });
+          }
+          if (line.startsWith('・')) {
+            return `${i + 1}. ${line.substring(1).trim()}`;
+          }
+          return `${i + 1}. ${line}`;
+        });
+        
+        return { 
+          success: true, 
+          block: normalized.join('\n'),
+          source: 'gijiyoshi_html_explicit'
+        };
+      }
+    }
+  }
+  
+  // パターン2: 見出し2と見出し3から階層的に抽出
+  const structure = [];
+  const lines = htmlText.split('\n');
+  
+  let currentH2 = null;
+  let h2Counter = 0;
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    
+    // 見出し2を検出
+    const h2Match = line.match(/^【見出し2】(.+)$/);
+    if (h2Match) {
+      const heading = h2Match[1].trim();
+      
+      // 除外ワード
+      const excludeWords = ['開会', '閉会', '出席者', '日時', '場所', '配付資料'];
+      if (excludeWords.some(word => heading.includes(word))) {
+        currentH2 = null;
+        continue;
+      }
+      
+      // タイトル行を除外
+      if (heading.includes('議事要旨') || heading.includes('議事録')) {
+        currentH2 = null;
+        continue;
+      }
+      
+      // 発言者名を除外
+      if (heading.match(/^[\u3000-\u9FFF]{2,6}(氏|委員)$/)) {
+        currentH2 = null;
+        continue;
+      }
+      
+      if (heading.includes('モデレーター')) {
+        currentH2 = null;
+        continue;
+      }
+      
+      h2Counter++;
+      currentH2 = { number: h2Counter, title: heading, children: [] };
+      structure.push(currentH2);
+      continue;
+    }
+    
+    // 見出し3を検出（現在のH2配下に追加）
+    const h3Match = line.match(/^【見出し3】(.+)$/);
+    if (h3Match && currentH2) {
+      const heading = h3Match[1].trim();
+      
+      // 発言者名を除外
+      if (heading.match(/^[\u3000-\u9FFF]{2,6}(氏|委員)$/)) {
+        continue;
+      }
+      
+      if (heading.includes('モデレーター')) {
+        continue;
+      }
+      
+      currentH2.children.push(heading);
+    }
+  }
+  
+  if (structure.length > 0) {
+    // 階層的にフォーマット
+    const formatted = [];
+    structure.forEach(item => {
+      formatted.push(`${item.number}. ${item.title}`);
+      item.children.forEach(child => {
+        formatted.push(`   - ${child}`);
+      });
+    });
+    
+    return {
+      success: true,
+      block: formatted.join('\n'),
+      source: 'gijiyoshi_html_hierarchical'
+    };
+  }
+  
+  return { success: false, block: '' };
+}
+
+/**
+ * Gemini API呼び出し（リトライ機構付き）
+ */
+function callGeminiWithRetry_(apiKey, model, userPrompt, systemInstruction, maxRetries = 2) {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      Logger.log(`[retry] 試行 ${i + 1}/${maxRetries}`);
+      
+      const result = callGemini_(apiKey, model, userPrompt, systemInstruction);
+      
+      if (result && result.length > 0) {
+        if (i > 0) {
+          Logger.log(`[retry] 成功（${i + 1}回目の試行）`);
+        }
+        return result;
+      }
+      
+      Logger.log(`[retry] 試行 ${i + 1}/${maxRetries} 失敗（空レスポンス）`);
+      
+      if (i < maxRetries - 1) {
+        const waitTime = (i + 1) * 2000; // 2秒, 4秒...
+        Logger.log(`[retry] ${waitTime}ms 待機後リトライ...`);
+        Utilities.sleep(waitTime);
+      }
+      
+    } catch (e) {
+      Logger.log(`[retry] 試行 ${i + 1}/${maxRetries} エラー: ${e.message}`);
+      
+      if (i === maxRetries - 1) {
+        Logger.log('[retry] 最大リトライ回数到達 - 諦める');
+        return '';
+      }
+      
+      const waitTime = (i + 1) * 2000;
+      Logger.log(`[retry] ${waitTime}ms 待機後リトライ...`);
+      Utilities.sleep(waitTime);
+    }
+  }
+  
+  Logger.log('[retry] 全試行失敗');
+  return '';
+}
+
+function callGemini_(apiKey, model, userPrompt, systemInstruction) {
+  const url = `https://generativelanguage.googleapis.com/v1/models/${model}:generateContent`;
+  
+  const payload = {
+    contents: [{ parts: [{ text: userPrompt }] }]
+  };
+  
+  if (systemInstruction) {
+    payload.system_instruction = { parts: [{ text: systemInstruction }] };
+  }
+
+  const options = {
+    method: 'post',
+    contentType: 'application/json',
+    headers: { 'x-goog-api-key': apiKey },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true,
+    timeout: 90000  // 90秒タイムアウト
+  };
+
+  try {
+    const response = UrlFetchApp.fetch(url, options);
+    const code = response.getResponseCode();
+    
+    Logger.log(`[gemini v1] http=${code} url=${url.substring(0, 100)}...`);
+    
+    if (code !== 200) {
+      Logger.log(`[gemini v1] error body: ${response.getContentText()}`);
+      return '';
+    }
+
+    const data = JSON.parse(response.getContentText());
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+    Logger.log(`[gemini v1] ok len=${text.length}`);
+    return text;
+    
+  } catch (e) {
+    Logger.log(`[gemini v1] exception: ${e.message}`);
+    return '';
+  }
+}
+
+
 /* ========================================================================== */
 /* 10. 本番テスト・デバッグ用関数                                             */
 /* ========================================================================== */
@@ -1722,7 +2282,14 @@ function sendLatestMeetingTest(sourceIds) {
       return;
     }
     
-    const pages = extractMeetingPages_(html, baseDir);
+    // 省庁によって抽出方法を変える
+    let pages = [];
+    if (src.agency === '金融庁') {
+      pages = extractFsaMeetingPages_(html, baseDir);
+    } else {
+      pages = extractMeetingPages_(html, baseDir);
+    }
+    
     if (!pages.length) {
       Logger.log('❌ 会議ページが見つかりません');
       return;
@@ -1736,7 +2303,13 @@ function sendLatestMeetingTest(sourceIds) {
       return;
     }
     
-    const mt = scrapeMeetingPage_(latest.url);
+    // 省庁によってスクレイピング方法を変える
+    let mt;
+    if (src.agency === '金融庁') {
+      mt = scrapeFsaMeetingPage_(latest.url);
+    } else {
+      mt = scrapeMeetingPage_(latest.url);
+    }
     
     if (!isMeetingPageLikelyValid_(mt)) {
       Logger.log('⚠️ ページがまだ公開されていない可能性があります');
@@ -1857,6 +2430,11 @@ function sendLatestMeetingTest(sourceIds) {
   });
   
   Logger.log(`\n\n🎉 全体完了: ${targetSources.length}会議のテスト送信が完了しました`);
+}
+
+/* test */
+function testsend(){
+  sendLatestMeetingTest(12)
 }
 
 /**
@@ -2930,4 +3508,1163 @@ function seedFsaMeetings() {
   saveState_(state);
   
   Logger.log('\n\n✅ 初回シード完了');
+}
+
+function seedNewFsaMeetings() {
+  const newIds = [12, 13, 14];
+  
+  Logger.log('=== 新規金融庁会議の初回シード ===\n');
+  
+  const sources = getSources_();
+  const state = loadState_();
+  
+  newIds.forEach(id => {
+    const src = sources.find(s => s.id === id);
+    
+    if (!src) {
+      Logger.log(`❌ ID=${id} が見つかりません`);
+      return;
+    }
+    
+    Logger.log(`\n[${src.id}] ${src.name}`);
+    Logger.log(`URL: ${src.indexUrl}`);
+    
+    const baseDir = toDir_(src.indexUrl);
+    const html = fetchText_(src.indexUrl);
+    
+    if (!html) {
+      Logger.log('  ❌ ページ取得失敗');
+      return;
+    }
+    
+    const pages = extractFsaMeetingPages_(html, baseDir);
+    
+    if (!pages.length) {
+      Logger.log('  ❌ 会議ページが見つかりません');
+      return;
+    }
+    
+    Logger.log(`  検出: ${pages.length}会議`);
+    
+    const latest = pages[0];
+    const mt = scrapeFsaMeetingPage_(latest.url);
+    
+    if (!mt) {
+      Logger.log('  ❌ スクレイピング失敗');
+      return;
+    }
+    
+    Logger.log(`  タイトル: ${mt.title}`);
+    Logger.log(`  日付: ${mt.date || '未検出'}`);
+    Logger.log(`  YouTube: ${mt.youtube || 'なし'}`);
+    Logger.log(`  PDF数: ${mt.pdfs.length}`);
+    
+    // 初回シード
+    state[src.indexUrl] = {
+      lastId: latest.id,
+      lastUrl: latest.url,
+      lastMeetingDate: mt.date || '日付不明',
+      lastCheckedAt: new Date().toISOString(),
+      pendingSummary: null
+    };
+    
+    Logger.log(`  ✅ シード完了: ID=${latest.id}`);
+    
+    Utilities.sleep(3000);
+  });
+  
+  saveState_(state);
+  
+  Logger.log('\n\n✅ 全会議のシード完了');
+}
+
+function debugSources() {
+  Logger.log('=== sourcesシートの内容確認 ===\n');
+  
+  const sheet = SpreadsheetApp.openById(CONFIG.SOURCES_SHEET.SHEET_ID)
+    .getSheetByName(CONFIG.SOURCES_SHEET.SHEET_NAME);
+  
+  const data = sheet.getDataRange().getValues();
+  
+  Logger.log(`総行数: ${data.length}`);
+  Logger.log('ヘッダー: ' + data[0].join(' | '));
+  Logger.log('\n全データ:');
+  
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    Logger.log(`[${i}] ID=${row[0]}, agency=${row[1]}, name=${row[2]}, active=${row[4]}`);
+  }
+  
+  Logger.log('\n\ngetSources_()の結果:');
+  CacheService.getScriptCache().remove('sources_cache');
+  const sources = getSources_();
+  Logger.log(`取得数: ${sources.length}`);
+  sources.forEach(s => {
+    Logger.log(`  [${s.id}] ${s.agency} - ${s.name}`);
+  });
+}
+
+function seedNewFsaMeetingsWithCacheClear() {
+  // キャッシュクリア
+  CacheService.getScriptCache().remove('sources_cache');
+  Logger.log('✅ キャッシュクリア完了\n');
+  
+  const newIds = [12, 13, 14];
+  
+  Logger.log('=== 新規金融庁会議の初回シード ===\n');
+  
+  const sources = getSources_();
+  Logger.log(`読み込んだ会議数: ${sources.length}\n`);
+  
+  const state = loadState_();
+  
+  newIds.forEach(id => {
+    const src = sources.find(s => s.id === id);
+    
+    if (!src) {
+      Logger.log(`❌ ID=${id} が見つかりません`);
+      return;
+    }
+    
+    Logger.log(`\n[${src.id}] ${src.name}`);
+    Logger.log(`URL: ${src.indexUrl}`);
+    
+    const baseDir = toDir_(src.indexUrl);
+    const html = fetchText_(src.indexUrl);
+    
+    if (!html) {
+      Logger.log('  ❌ ページ取得失敗');
+      return;
+    }
+    
+    const pages = extractFsaMeetingPages_(html, baseDir);
+    
+    if (!pages.length) {
+      Logger.log('  ❌ 会議ページが見つかりません');
+      return;
+    }
+    
+    Logger.log(`  検出: ${pages.length}会議`);
+    
+    const latest = pages[0];
+    const mt = scrapeFsaMeetingPage_(latest.url);
+    
+    if (!mt) {
+      Logger.log('  ❌ スクレイピング失敗');
+      return;
+    }
+    
+    Logger.log(`  タイトル: ${mt.title}`);
+    Logger.log(`  日付: ${mt.date || '未検出'}`);
+    Logger.log(`  YouTube: ${mt.youtube || 'なし'}`);
+    Logger.log(`  PDF数: ${mt.pdfs.length}`);
+    
+    // 初回シード
+    state[src.indexUrl] = {
+      lastId: latest.id,
+      lastUrl: latest.url,
+      lastMeetingDate: mt.date || '日付不明',
+      lastCheckedAt: new Date().toISOString(),
+      pendingSummary: null
+    };
+    
+    Logger.log(`  ✅ シード完了: ID=${latest.id}`);
+    
+    Utilities.sleep(3000);
+  });
+  
+  saveState_(state);
+  
+  Logger.log('\n\n✅ 全会議のシード完了');
+}
+
+function testNewFsaMeetings() {
+  Logger.log('=== 新規金融庁会議のテスト送信 ===\n');
+  
+  const newIds = [12, 13, 14];
+  
+  newIds.forEach((id, index) => {
+    Logger.log(`\n[${index + 1}/3] ID=${id} テスト送信開始`);
+    sendLatestMeetingTest(id);
+    
+    if (index < newIds.length - 1) {
+      Logger.log('\n待機中...');
+      Utilities.sleep(5000);  // 5秒待機
+    }
+  });
+  
+  Logger.log('\n\n✅ 全会議のテスト送信完了');
+}
+
+function debugFsaDateExtraction() {
+  const urls = [
+    'https://www.fsa.go.jp/singi/singi_kinyu/shijoseido_wg/gijishidai/20251015.html',
+    'https://www.fsa.go.jp/singi/singi_kinyu/disclosure_wg/shiryou/20251015.html',
+    'https://www.fsa.go.jp/singi/revision_corporategovernance/siryo/20251021.html'
+  ];
+  
+  urls.forEach((url, idx) => {
+    Logger.log(`\n${'='.repeat(80)}`);
+    Logger.log(`[${idx + 1}/3] ${url}`);
+    Logger.log('='.repeat(80));
+    
+    const html = fetchText_(url);
+    
+    if (!html) {
+      Logger.log('❌ 取得失敗');
+      return;
+    }
+    
+    Logger.log(`✅ 取得: ${html.length}文字\n`);
+    
+    // 令和表記を探す
+    Logger.log('■ 令和表記:');
+    const reiwaMatches = html.match(/令和[0-9０-９]+年[0-9０-９]+月[0-9０-９]+日/g);
+    if (reiwaMatches) {
+      reiwaMatches.forEach(m => Logger.log(`  ${m}`));
+    } else {
+      Logger.log('  なし');
+    }
+    
+    // <li>タグ内の日時
+    Logger.log('\n■ <li>タグ（日時含む）:');
+    const liMatches = html.match(/<li[^>]*?>[^<]*?日時[^<]*?<\/li>/gi);
+    if (liMatches) {
+      liMatches.forEach(m => {
+        const text = m.replace(/<[^>]+>/g, '');
+        Logger.log(`  ${text}`);
+      });
+    } else {
+      Logger.log('  なし');
+    }
+    
+    // URLから日付
+    Logger.log('\n■ URLから抽出:');
+    const urlMatch = url.match(/(\d{8})\.html$/);
+    if (urlMatch) {
+      const dateStr = urlMatch[1];
+      const year = dateStr.substring(0, 4);
+      const month = parseInt(dateStr.substring(4, 6));
+      const day = parseInt(dateStr.substring(6, 8));
+      Logger.log(`  ${year}年${month}月${day}日`);
+    }
+    
+    Utilities.sleep(2000);
+  });
+  
+  Logger.log('\n\n✅ デバッグ完了');
+}
+
+function forceSendTest() {
+  Logger.log('=== 強制送信テスト（重複チェックなし） ===\n');
+  
+  const sources = getSources_();
+  const src = sources.find(s => s.id === 12);
+  
+  if (!src) {
+    Logger.log('❌ 会議が見つかりません');
+    return;
+  }
+  
+  Logger.log(`[${src.id}] ${src.name}`);
+  
+  const baseDir = toDir_(src.indexUrl);
+  const html = fetchText_(src.indexUrl);
+  const pages = extractFsaMeetingPages_(html, baseDir);
+  const latest = pages[0];
+  
+  Logger.log(`URL: ${latest.url}\n`);
+  
+  const mt = scrapeFsaMeetingPage_(latest.url);
+  
+  Logger.log(`タイトル: ${mt.title}`);
+  Logger.log(`日付: ${mt.date || '未検出'}`);
+  Logger.log(`YouTube: ${mt.youtube || 'なし'}`);
+  Logger.log(`PDF数: ${mt.pdfs.length}\n`);
+  
+  if (!mt.date) {
+    Logger.log('❌ 日付が取得できていません');
+    return;
+  }
+  
+  Logger.log('✅ 日付抽出成功！');
+  
+  // メール送信（テスト用なので重複チェックなし）
+  const agendaPdf = mt.pdfs.find(x => x.isAgenda);
+  const rosterPdf = mt.pdfs.find(x => x.isRoster);
+  
+  const { subject, plain, htmlBody } = buildMailWithSummary_(
+    mt, 
+    '', 
+    buildLinksBlock_(mt, agendaPdf, rosterPdf), 
+    'テスト', 
+    '（議題未検出）'
+  );
+  
+  Logger.log(`\n件名: ${subject}\n`);
+  
+  const recObjs = getRecipientsForSource_(src.name);
+  
+  if (recObjs.length > 0) {
+    const r = recObjs[0];
+    
+    const unsubUrl = `${CONFIG.APP.BASE_WEBAPP_URL}?action=unsubscribe&token=${encodeURIComponent(r.token)}&email=${encodeURIComponent(r.email)}&source=${encodeURIComponent(src.name)}`;
+    const resubUrl = `${CONFIG.APP.BASE_WEBAPP_URL}?action=resub&token=${encodeURIComponent(r.token)}&email=${encodeURIComponent(r.email)}&source=${encodeURIComponent(src.name)}`;
+    
+    const footer = `
+――――――――――――
+配信設定: 停止 ${unsubUrl}
+再登録: ${resubUrl}
+
+© Klammer Inc.`;
+    
+    const plainPerUser = plain + footer;
+    const htmlPerUser = injectFooterHtml_(htmlBody, unsubUrl, resubUrl);
+    
+    sendToRecipients_([r.email], '[強制テスト] ' + subject, plainPerUser, htmlPerUser);
+    
+    Logger.log(`✅ 送信完了: ${r.email}`);
+  }
+}
+
+function retestWithCleanArchive() {
+  Logger.log('=== Archive削除 + 再テスト ===\n');
+  
+  // 1. Archive削除
+  deleteArchiveRecordForTest();
+  
+  Logger.log('\n待機中...\n');
+  Utilities.sleep(2000);
+  
+  // 2. 再テスト（1件のみ）
+  sendLatestMeetingTest(12);
+}
+
+function deleteArchiveRecordForTest() {
+  const sheet = SpreadsheetApp.openById(CONFIG.ARCHIVE.SHEET_ID)
+    .getSheetByName(CONFIG.ARCHIVE.SHEET_NAME);
+  
+  const data = sheet.getDataRange().getValues();
+  
+  Logger.log('=== Archive削除 ===\n');
+  
+  // 削除対象: sourceId=12,13,14 の最新レコード
+  const targetIds = [12, 13, 14];
+  const rowsToDelete = [];
+  
+  for (let i = data.length - 1; i >= 1; i--) {
+    const row = data[i];
+    const sourceId = row[1];
+    
+    if (targetIds.includes(sourceId)) {
+      rowsToDelete.push(i + 1);  // 行番号は1始まり
+      Logger.log(`削除対象: 行${i + 1}, sourceId=${sourceId}, title=${row[6]}`);
+    }
+  }
+  
+  // 後ろから削除（行番号がズレないように）
+  rowsToDelete.sort((a, b) => b - a);
+  rowsToDelete.forEach(rowNum => {
+    sheet.deleteRow(rowNum);
+    Logger.log(`✅ 行${rowNum}を削除`);
+  });
+  
+  Logger.log(`\n✅ ${rowsToDelete.length}件削除完了`);
+}
+
+
+function testAllFsaMeetingsWithGijiyoshi() {
+  const sources = getSources_();
+  const fsaSources = sources.filter(s => s.agency === '金融庁');
+  
+  Logger.log('=== 金融庁全会議の議事要旨要約テスト ===\n');
+  Logger.log(`対象: ${fsaSources.length}会議\n`);
+  
+  const results = [];
+  
+  fsaSources.forEach((src, index) => {
+    Logger.log(`\n${'='.repeat(80)}`);
+    Logger.log(`[${index + 1}/${fsaSources.length}] [ID=${src.id}] ${src.name}`);
+    Logger.log('='.repeat(80));
+    
+    const html = fetchText_(src.indexUrl);
+    
+    if (!html) {
+      Logger.log('❌ インデックスページ取得失敗');
+      results.push({ id: src.id, name: src.name, status: 'fetch_failed' });
+      return;
+    }
+    
+    // 議事要旨・議事録のリンクを探す
+    const gijiyoshiPattern = /href="([^"]*(?:gijiyoshi|gijiroku)\/\d{8}\.html)"/gi;
+    const matches = [];
+    let m;
+    
+    while ((m = gijiyoshiPattern.exec(html)) !== null) {
+      const relPath = m[1];
+      const baseDir = toDir_(src.indexUrl);
+      const url = absoluteUrl_(baseDir, relPath);
+      
+      const dateMatch = relPath.match(/(\d{8})\.html$/);
+      if (dateMatch) {
+        matches.push({
+          date: dateMatch[1],
+          url: url
+        });
+      }
+    }
+    
+    if (matches.length === 0) {
+      Logger.log('❌ 議事要旨なし（まだ公開されていない可能性）');
+      results.push({ id: src.id, name: src.name, status: 'no_gijiyoshi' });
+      Utilities.sleep(3000);
+      return;
+    }
+    
+    // 最新の議事要旨を使用
+    matches.sort((a, b) => b.date - a.date);
+    const latest = matches[0];
+    
+    Logger.log(`✅ 議事要旨: ${matches.length}件`);
+    Logger.log(`最新: ${latest.date} - ${latest.url}\n`);
+    
+    // スクレイピング
+    const mt = scrapeFsaMeetingPage_(latest.url);
+    
+    if (!mt) {
+      Logger.log('❌ スクレイピング失敗');
+      results.push({ id: src.id, name: src.name, status: 'scrape_failed' });
+      Utilities.sleep(3000);
+      return;
+    }
+    
+    Logger.log(`タイトル: ${mt.title}`);
+    Logger.log(`日付: ${mt.date || '未記載'}`);
+    Logger.log(`PDF数: ${mt.pdfs.length}\n`);
+    
+    // 議事要旨PDFを探す
+    const gijiyoshiPdf = mt.pdfs.find(p => 
+      p.title.includes('議事要旨') || 
+      p.title.includes('議事録') ||
+      p.title.includes('議事概要')
+    );
+    
+    if (!gijiyoshiPdf) {
+      Logger.log('❌ 議事要旨PDFが見つかりません');
+      Logger.log('PDF一覧:');
+      mt.pdfs.forEach(p => Logger.log(`  - ${p.title}`));
+      results.push({ id: src.id, name: src.name, status: 'no_pdf' });
+      Utilities.sleep(3000);
+      return;
+    }
+    
+    Logger.log(`✅ 議事要旨PDF: ${gijiyoshiPdf.title}`);
+    
+    // PDF OCR
+    Logger.log('📄 議事要旨PDF取得中...');
+    const gijiyoshiText = extractPdfTextViaVps_(gijiyoshiPdf.url);
+    Logger.log(`  取得: ${gijiyoshiText.length}文字`);
+    
+    if (!gijiyoshiText || gijiyoshiText.length < 500) {
+      Logger.log('⚠️ 議事要旨テキストが短すぎます');
+      results.push({ id: src.id, name: src.name, status: 'text_too_short' });
+      Utilities.sleep(3000);
+      return;
+    }
+    
+    // 議事次第・名簿
+    const agendaPdf = mt.pdfs.find(x => x.isAgenda);
+    const rosterPdf = mt.pdfs.find(x => x.isRoster);
+    
+    let agendaText = '', rosterText = '';
+    
+    if (agendaPdf) {
+      Logger.log('📄 議事次第PDF取得中...');
+      agendaText = extractPdfTextViaVps_(agendaPdf.url);
+      Logger.log(`  取得: ${agendaText.length}文字`);
+    }
+    
+    if (rosterPdf) {
+      Logger.log('📄 委員名簿PDF取得中...');
+      rosterText = extractPdfTextViaVps_(rosterPdf.url);
+      Logger.log(`  取得: ${rosterText.length}文字`);
+    }
+    
+    // 要約生成
+    Logger.log('\n🤖 要約生成中...');
+    const finalSummary = summarizeMeeting_(mt, agendaText, rosterText, gijiyoshiText) || '';
+    Logger.log(`  生成: ${finalSummary.length}文字`);
+    
+    if (!finalSummary || finalSummary.length < 500) {
+      Logger.log('⚠️ 要約が短すぎます');
+      results.push({ id: src.id, name: src.name, status: 'summary_too_short' });
+      Utilities.sleep(3000);
+      return;
+    }
+    
+    Logger.log('✅ 要約生成成功\n');
+    
+    // メール作成
+    const sourceTag = '議事要旨（PDF）';
+    const agendaSmart = extractAgendaSmartFromGijishidai_(agendaText || '');
+    const agendaBlock = agendaSmart.block || fallbackAgendaFromTitleOrPdfs_(mt) || '';
+    
+    const { subject, plain, htmlBody } = buildMailWithSummary_(
+      mt, 
+      finalSummary, 
+      buildLinksBlock_(mt, agendaPdf, rosterPdf) + `\n・議事要旨：${gijiyoshiPdf.url}`,
+      sourceTag, 
+      agendaBlock
+    );
+    
+    Logger.log(`件名: ${subject}\n`);
+    
+    // 送信
+    const recObjs = getRecipientsForSource_(src.name);
+    
+    if (!recObjs.length) {
+      Logger.log('⚠️ 購読者なし');
+      results.push({ id: src.id, name: src.name, status: 'no_recipients' });
+      Utilities.sleep(3000);
+      return;
+    }
+    
+    const r = recObjs[0];
+    
+    const unsubUrl = `${CONFIG.APP.BASE_WEBAPP_URL}?action=unsubscribe&token=${encodeURIComponent(r.token)}&email=${encodeURIComponent(r.email)}&source=${encodeURIComponent(src.name)}`;
+    const resubUrl = `${CONFIG.APP.BASE_WEBAPP_URL}?action=resub&token=${encodeURIComponent(r.token)}&email=${encodeURIComponent(r.email)}&source=${encodeURIComponent(src.name)}`;
+    
+    const footer = `
+――――――――――――
+配信設定: 停止 ${unsubUrl}
+再登録: ${resubUrl}
+
+© Klammer Inc.`;
+    
+    const plainPerUser = plain + footer;
+    const htmlPerUser = injectFooterHtml_(htmlBody, unsubUrl, resubUrl);
+    
+    sendToRecipients_([r.email], '[テスト・議事要旨] ' + subject, plainPerUser, htmlPerUser);
+    
+    Logger.log(`✅ 送信完了: ${r.email}`);
+    
+    results.push({ 
+      id: src.id, 
+      name: src.name, 
+      status: 'success',
+      date: latest.date,
+      summaryLength: finalSummary.length
+    });
+    
+    Logger.log('\n待機中...');
+    Utilities.sleep(5000);  // 5秒待機
+  });
+  
+  // サマリー表示
+  Logger.log('\n\n' + '='.repeat(80));
+  Logger.log('📊 テスト結果サマリー');
+  Logger.log('='.repeat(80));
+  
+  results.forEach(r => {
+    const statusEmoji = r.status === 'success' ? '✅' : '❌';
+    Logger.log(`${statusEmoji} [${r.id}] ${r.name}: ${r.status}`);
+    if (r.status === 'success') {
+      Logger.log(`   日付: ${r.date}, 要約: ${r.summaryLength}文字`);
+    }
+  });
+  
+  const successCount = results.filter(r => r.status === 'success').length;
+  Logger.log(`\n✅ 成功: ${successCount}/${results.length}会議`);
+  Logger.log('\n🎉 全会議テスト完了');
+}
+
+// 議事要旨から要約メールを生成
+function sendGijiyoshiSummaryTest(sourceId, gijiyoshiUrl) {
+  const sources = getSources_();
+  const src = sources.find(s => s.id === sourceId);
+  
+  if (!src) {
+    Logger.log('❌ 会議が見つかりません');
+    return;
+  }
+  
+  Logger.log(`=== 議事要旨要約テスト ===`);
+  Logger.log(`[${src.id}] ${src.name}`);
+  Logger.log(`URL: ${gijiyoshiUrl}\n`);
+  
+  // 議事要旨ページをスクレイピング
+  const mt = scrapeFsaMeetingPage_(gijiyoshiUrl);
+  
+  if (!mt) {
+    Logger.log('❌ スクレイピング失敗');
+    return;
+  }
+  
+  Logger.log(`タイトル: ${mt.title}`);
+  Logger.log(`日付: ${mt.date}`);
+  Logger.log(`PDF数: ${mt.pdfs.length}\n`);
+  
+  // 議事要旨PDFを探す
+  const gijiyoshiPdf = mt.pdfs.find(p => 
+    p.title.includes('議事要旨') || 
+    p.title.includes('議事録') ||
+    p.title.includes('議事概要')
+  );
+  
+  if (!gijiyoshiPdf) {
+    Logger.log('❌ 議事要旨PDFが見つかりません');
+    Logger.log('PDF一覧:');
+    mt.pdfs.forEach(p => Logger.log(`  - ${p.title}`));
+    return;
+  }
+  
+  Logger.log(`✅ 議事要旨PDF: ${gijiyoshiPdf.title}`);
+  Logger.log(`   ${gijiyoshiPdf.url}\n`);
+  
+  // PDF OCR
+  Logger.log('📄 議事要旨PDF取得中...');
+  const gijiyoshiText = extractPdfTextViaVps_(gijiyoshiPdf.url);
+  Logger.log(`  取得: ${gijiyoshiText.length}文字\n`);
+  
+  if (!gijiyoshiText || gijiyoshiText.length < 500) {
+    Logger.log('⚠️ 議事要旨テキストが短すぎます');
+    return;
+  }
+  
+  // 議事次第・名簿も取得
+  const agendaPdf = mt.pdfs.find(x => x.isAgenda);
+  const rosterPdf = mt.pdfs.find(x => x.isRoster);
+  
+  let agendaText = '', rosterText = '';
+  
+  if (agendaPdf) {
+    Logger.log('📄 議事次第PDF取得中...');
+    agendaText = extractPdfTextViaVps_(agendaPdf.url);
+    Logger.log(`  取得: ${agendaText.length}文字`);
+  }
+  
+  if (rosterPdf) {
+    Logger.log('📄 委員名簿PDF取得中...');
+    rosterText = extractPdfTextViaVps_(rosterPdf.url);
+    Logger.log(`  取得: ${rosterText.length}文字`);
+  }
+  
+  Logger.log('\n🤖 要約生成中...');
+  
+  // 議事要旨を「transcript」として要約生成
+  const finalSummary = summarizeMeeting_(mt, agendaText, rosterText, gijiyoshiText) || '';
+  
+  Logger.log(`  生成: ${finalSummary.length}文字\n`);
+  
+  if (!finalSummary || finalSummary.length < 500) {
+    Logger.log('⚠️ 要約が短すぎます');
+    Logger.log('要約内容:');
+    Logger.log(finalSummary);
+    return;
+  }
+  
+  Logger.log('✅ 要約生成成功\n');
+  
+  // メール作成
+  const sourceTag = '議事要旨（PDF）';
+  const agendaSmart = extractAgendaSmartFromGijishidai_(agendaText || '');
+  const agendaBlock = agendaSmart.block || fallbackAgendaFromTitleOrPdfs_(mt) || '';
+  
+  const { subject, plain, htmlBody } = buildMailWithSummary_(
+    mt, 
+    finalSummary, 
+    buildLinksBlock_(mt, agendaPdf, rosterPdf) + `\n・議事要旨：${gijiyoshiPdf.url}`,
+    sourceTag, 
+    agendaBlock
+  );
+  
+  Logger.log(`件名: ${subject}\n`);
+  
+  // 送信
+  const recObjs = getRecipientsForSource_(src.name);
+  
+  if (!recObjs.length) {
+    Logger.log('⚠️ 購読者なし');
+    return;
+  }
+  
+  const r = recObjs[0];
+  
+  const unsubUrl = `${CONFIG.APP.BASE_WEBAPP_URL}?action=unsubscribe&token=${encodeURIComponent(r.token)}&email=${encodeURIComponent(r.email)}&source=${encodeURIComponent(src.name)}`;
+  const resubUrl = `${CONFIG.APP.BASE_WEBAPP_URL}?action=resub&token=${encodeURIComponent(r.token)}&email=${encodeURIComponent(r.email)}&source=${encodeURIComponent(src.name)}`;
+  
+  const footer = `
+――――――――――――
+配信設定: 停止 ${unsubUrl}
+再登録: ${resubUrl}
+
+© Klammer Inc.`;
+  
+  const plainPerUser = plain + footer;
+  const htmlPerUser = injectFooterHtml_(htmlBody, unsubUrl, resubUrl);
+  
+  sendToRecipients_([r.email], '[テスト・議事要旨] ' + subject, plainPerUser, htmlPerUser);
+  
+  Logger.log(`✅ 送信完了: ${r.email}`);
+}
+
+function testAllFsaMeetingsWithGijiyoshiV2() {
+  const sources = getSources_();
+  const fsaSources = sources.filter(s => s.agency === '金融庁');
+  
+  Logger.log('=== 金融庁全会議の議事要旨要約テスト（HTML版） ===\n');
+  Logger.log(`対象: ${fsaSources.length}会議\n`);
+  
+  const results = [];
+  
+  fsaSources.forEach((src, index) => {
+    Logger.log(`\n${'='.repeat(80)}`);
+    Logger.log(`[${index + 1}/${fsaSources.length}] [ID=${src.id}] ${src.name}`);
+    Logger.log('='.repeat(80));
+    
+    const html = fetchText_(src.indexUrl);
+    
+    if (!html) {
+      Logger.log('❌ インデックスページ取得失敗');
+      results.push({ id: src.id, name: src.name, status: 'fetch_failed' });
+      return;
+    }
+    
+    // 議事要旨・議事録のリンクを探す
+    const gijiyoshiPattern = /href="([^"]*(?:gijiyoshi|gijiroku)\/\d{8}\.html)"/gi;
+    const matches = [];
+    let m;
+    
+    while ((m = gijiyoshiPattern.exec(html)) !== null) {
+      const relPath = m[1];
+      const baseDir = toDir_(src.indexUrl);
+      const url = absoluteUrl_(baseDir, relPath);
+      
+      const dateMatch = relPath.match(/(\d{8})\.html$/);
+      if (dateMatch) {
+        matches.push({
+          date: dateMatch[1],
+          url: url
+        });
+      }
+    }
+    
+    if (matches.length === 0) {
+      Logger.log('❌ 議事要旨なし（まだ公開されていない可能性）');
+      results.push({ id: src.id, name: src.name, status: 'no_gijiyoshi' });
+      Utilities.sleep(3000);
+      return;
+    }
+    
+    // 最新の議事要旨を使用
+    matches.sort((a, b) => b.date - a.date);
+    const latest = matches[0];
+    
+    Logger.log(`✅ 議事要旨: ${matches.length}件`);
+    Logger.log(`最新: ${latest.date} - ${latest.url}\n`);
+    
+    // 議事要旨HTMLを取得
+    const gijiyoshiHtml = fetchText_(latest.url);
+    
+    if (!gijiyoshiHtml) {
+      Logger.log('❌ 議事要旨ページ取得失敗');
+      results.push({ id: src.id, name: src.name, status: 'fetch_failed' });
+      Utilities.sleep(3000);
+      return;
+    }
+    
+    // スクレイピング（メタ情報取得）
+    const mt = scrapeFsaMeetingPage_(latest.url);
+    
+    if (!mt) {
+      Logger.log('❌ スクレイピング失敗');
+      results.push({ id: src.id, name: src.name, status: 'scrape_failed' });
+      Utilities.sleep(3000);
+      return;
+    }
+    
+    Logger.log(`タイトル: ${mt.title}`);
+    Logger.log(`日付: ${mt.date || '未記載'}`);
+    
+    // HTMLから議事要旨テキストを抽出
+    Logger.log('\n📄 HTML議事要旨抽出中...');
+    const gijiyoshiText = extractGijiyoshiTextFromHtml_(gijiyoshiHtml);
+    Logger.log(`  抽出: ${gijiyoshiText.length}文字`);
+    
+    if (!gijiyoshiText || gijiyoshiText.length < 1000) {
+      Logger.log('⚠️ 議事要旨テキストが短すぎます');
+      Logger.log('抽出内容（最初の500文字）:');
+      Logger.log(gijiyoshiText.substring(0, 500));
+      results.push({ id: src.id, name: src.name, status: 'text_too_short' });
+      Utilities.sleep(3000);
+      return;
+    }
+    
+    // 議事次第・名簿（資料ページから取得）
+    const baseDir = toDir_(src.indexUrl);
+    const indexHtml = html;  // 既に取得済み
+    const pages = extractFsaMeetingPages_(indexHtml, baseDir);
+    
+    let agendaText = '', rosterText = '';
+    
+    // 同じ日付の資料ページを探す
+    const sameDate = pages.find(p => p.id.toString() === latest.date);
+    if (sameDate) {
+      Logger.log(`\n📄 資料ページ: ${sameDate.url}`);
+    // 資料ページURLをmtに設定
+      mt.pageUrl = sameDate.url;
+      const shiryoMt = scrapeFsaMeetingPage_(sameDate.url);
+      
+      if (shiryoMt) {
+        const agendaPdf = shiryoMt.pdfs.find(x => x.isAgenda);
+        const rosterPdf = shiryoMt.pdfs.find(x => x.isRoster);
+        
+        if (agendaPdf) {
+          Logger.log('📄 議事次第PDF取得中...');
+          agendaText = extractPdfTextViaVps_(agendaPdf.url);
+          Logger.log(`  取得: ${agendaText.length}文字`);
+        }
+        
+        if (rosterPdf) {
+          Logger.log('📄 委員名簿PDF取得中...');
+          rosterText = extractPdfTextViaVps_(rosterPdf.url);
+          Logger.log(`  取得: ${rosterText.length}文字`);
+        }
+      }
+    }
+    
+    // 要約生成
+    Logger.log('\n🤖 要約生成中...');
+    const finalSummary = summarizeMeeting_(mt, agendaText, rosterText, gijiyoshiText) || '';
+    Logger.log(`  生成: ${finalSummary.length}文字`);
+    
+    if (!finalSummary || finalSummary.length < 500) {
+      Logger.log('⚠️ 要約が短すぎます');
+      results.push({ id: src.id, name: src.name, status: 'summary_too_short' });
+      Utilities.sleep(3000);
+      return;
+    }
+    
+    Logger.log('✅ 要約生成成功\n');
+    
+    // メール作成
+    const sourceTag = '議事要旨（HTML）';
+    const agendaSmart = extractAgendaSmartFromGijishidai_(agendaText || '');
+    const agendaBlock = agendaSmart.block || fallbackAgendaFromTitleOrPdfs_(mt) || '';
+    
+    const agendaPdf = mt.pdfs.find(x => x.isAgenda);
+    const rosterPdf = mt.pdfs.find(x => x.isRoster);
+    
+    const { subject, plain, htmlBody } = buildMailWithSummary_(
+      mt, 
+      finalSummary, 
+      buildLinksBlock_(mt, agendaPdf, rosterPdf) + `\n・議事要旨：${latest.url}`,
+      sourceTag, 
+      agendaBlock
+    );
+    
+    Logger.log(`件名: ${subject}\n`);
+    
+    // 送信
+    const recObjs = getRecipientsForSource_(src.name);
+    
+    if (!recObjs.length) {
+      Logger.log('⚠️ 購読者なし');
+      results.push({ id: src.id, name: src.name, status: 'no_recipients' });
+      Utilities.sleep(3000);
+      return;
+    }
+    
+    const r = recObjs[0];
+    
+    const unsubUrl = `${CONFIG.APP.BASE_WEBAPP_URL}?action=unsubscribe&token=${encodeURIComponent(r.token)}&email=${encodeURIComponent(r.email)}&source=${encodeURIComponent(src.name)}`;
+    const resubUrl = `${CONFIG.APP.BASE_WEBAPP_URL}?action=resub&token=${encodeURIComponent(r.token)}&email=${encodeURIComponent(r.email)}&source=${encodeURIComponent(src.name)}`;
+    
+    const footer = `
+――――――――――――
+配信設定: 停止 ${unsubUrl}
+再登録: ${resubUrl}
+
+© Klammer Inc.`;
+    
+    const plainPerUser = plain + footer;
+    const htmlPerUser = injectFooterHtml_(htmlBody, unsubUrl, resubUrl);
+    
+    sendToRecipients_([r.email], '[テスト・議事要旨] ' + subject, plainPerUser, htmlPerUser);
+    
+    Logger.log(`✅ 送信完了: ${r.email}`);
+    
+    results.push({ 
+      id: src.id, 
+      name: src.name, 
+      status: 'success',
+      date: latest.date,
+      summaryLength: finalSummary.length
+    });
+    
+    Logger.log('\n待機中...');
+    Utilities.sleep(10000);  // 10秒待機（Gemini負荷軽減）
+  });
+  
+  // サマリー表示
+  Logger.log('\n\n' + '='.repeat(80));
+  Logger.log('📊 テスト結果サマリー');
+  Logger.log('='.repeat(80));
+  
+  results.forEach(r => {
+    const statusEmoji = r.status === 'success' ? '✅' : '❌';
+    Logger.log(`${statusEmoji} [${r.id}] ${r.name}: ${r.status}`);
+    if (r.status === 'success') {
+      Logger.log(`   日付: ${r.date}, 要約: ${r.summaryLength}文字`);
+    }
+  });
+  
+  const successCount = results.filter(r => r.status === 'success').length;
+  Logger.log(`\n✅ 成功: ${successCount}/${results.length}会議`);
+  Logger.log('\n🎉 全会議テスト完了');
+}
+
+// 1会議だけテスト
+function testOneFsaGijiyoshi() {
+  const sources = getSources_();
+  const src = sources.find(s => s.id === 9);  // AI官民フォーラム
+  
+  sendGijiyoshiSummaryTest(src.id, 'https://www.fsa.go.jp/singi/ai_forum/gijiyoshi/20251024.html');
+}
+
+/**
+ * 金融庁の議事要旨HTML要約テスト（1会議）
+ */
+function testFsaGijiyoshiHtmlSummary() {
+  const sourceId = 9;  // AI官民フォーラム
+  const gijiyoshiUrl = 'https://www.fsa.go.jp/singi/ai_forum/gijiyoshi/20251024.html';
+  
+  const sources = getSources_();
+  const src = sources.find(s => s.id === sourceId);
+  
+  if (!src) {
+    Logger.log('❌ 会議が見つかりません');
+    return;
+  }
+  
+  Logger.log('=== 金融庁議事要旨HTML要約テスト ===');
+  Logger.log(`[${src.id}] ${src.name}`);
+  Logger.log(`URL: ${gijiyoshiUrl}\n`);
+  
+  // 議事要旨HTMLを取得
+  const gijiyoshiHtml = fetchText_(gijiyoshiUrl);
+  
+  if (!gijiyoshiHtml) {
+    Logger.log('❌ 議事要旨ページ取得失敗');
+    return;
+  }
+  
+  // スクレイピング（メタ情報取得）
+  const mt = scrapeFsaMeetingPage_(gijiyoshiUrl);
+  
+  if (!mt) {
+    Logger.log('❌ スクレイピング失敗');
+    return;
+  }
+  
+  Logger.log(`タイトル: ${mt.title}`);
+  Logger.log(`日付: ${mt.date || '未記載'}`);
+  
+  // HTMLから議事要旨テキストを抽出
+  Logger.log('\n📄 HTML議事要旨抽出中...');
+  const gijiyoshiText = extractGijiyoshiTextFromHtml_(gijiyoshiHtml);
+  Logger.log(`  抽出: ${gijiyoshiText.length}文字`);
+  
+  if (!gijiyoshiText || gijiyoshiText.length < 1000) {
+    Logger.log('⚠️ 議事要旨テキストが短すぎます');
+    return;
+  }
+  
+  // 要約生成（修正版が動くか確認）
+  Logger.log('\n🤖 要約生成中...');
+  const finalSummary = summarizeMeeting_(mt, '', '', gijiyoshiText) || '';
+  Logger.log(`  生成: ${finalSummary.length}文字`);
+  
+  if (!finalSummary || finalSummary.length < 500) {
+    Logger.log('⚠️ 要約が短すぎます');
+    Logger.log('要約内容:');
+    Logger.log(finalSummary);
+    return;
+  }
+  
+  Logger.log('✅ 要約生成成功\n');
+  Logger.log('━━━━━━━━━━━━━━━━━━');
+  Logger.log('生成された要約:');
+  Logger.log('━━━━━━━━━━━━━━━━━━');
+  Logger.log(finalSummary);
+  Logger.log('━━━━━━━━━━━━━━━━━━');
+  
+  // メール送信はスキップ（ログで確認のみ）
+  Logger.log('\n✅ テスト完了（メール送信はスキップ）');
+}
+
+function debugGijiyoshiTextExtraction() {
+  const url = 'https://www.fsa.go.jp/singi/ai_forum/gijiyoshi/20251024.html';
+  
+  Logger.log('=== 議事要旨テキスト抽出デバッグ ===\n');
+  
+  const html = fetchText_(url);
+  const text = extractGijiyoshiTextFromHtml_(html);
+  
+  Logger.log(`抽出文字数: ${text.length}\n`);
+  Logger.log('━━━━━━━━━━━━━━━━━━');
+  Logger.log('抽出されたテキスト（最初の2000文字）:');
+  Logger.log('━━━━━━━━━━━━━━━━━━');
+  Logger.log(text.substring(0, 2000));
+  Logger.log('━━━━━━━━━━━━━━━━━━');
+  
+  // 議題抽出テスト
+  Logger.log('\n■ 議題抽出テスト:');
+  const agendaResult = extractAgendaFromGijiyoshiHtml_(text);
+  Logger.log(`成功: ${agendaResult.success}`);
+  Logger.log(`議題:\n${agendaResult.block}`);
+}
+
+
+
+/**
+ * 経産省会議の複数要約テスト
+ */
+function testMultipleMetiMeetings() {
+  Logger.log('=== 経産省会議複数要約テスト ===\n');
+  
+  const testCases = [
+    {
+      id: 1,
+      name: '総合資源エネルギー調査会 基本政策分科会',
+      url: 'https://www.meti.go.jp/shingikai/enecho/denryoku_gas/saisei_kano/086.html'
+    },
+    {
+      id: 2,
+      name: '産業構造審議会 経済産業政策新機軸部会',
+      url: 'https://www.meti.go.jp/shingikai/sankoshin/seisaku_kijiku/038.html'
+    },
+    {
+      id: 3,
+      name: 'デジタル時代の人材政策に関する検討会',
+      url: 'https://www.meti.go.jp/shingikai/mono_info_service/digital_jinzai/019.html'
+    }
+  ];
+  
+  const sources = getSources_();
+  const results = [];
+  
+  for (let i = 0; i < testCases.length; i++) {
+    const tc = testCases[i];
+    const src = sources.find(s => s.id === tc.id);
+    
+    Logger.log('================================================================================');
+    Logger.log(`[${i + 1}/${testCases.length}] [ID=${tc.id}] ${tc.name}`);
+    Logger.log('================================================================================');
+    
+    try {
+      // スクレイピング
+      const mt = scrapeMeetingPage_(tc.url);
+      Logger.log(`タイトル: ${mt.title}`);
+      Logger.log(`日付: ${mt.date || '未記載'}`);
+      
+      const agendaPdf = mt.pdfs.find(x => x.isAgenda);
+      const rosterPdf = mt.pdfs.find(x => x.isRoster);
+      
+      // PDF OCR
+      let agendaText = '', rosterText = '';
+      if (agendaPdf) {
+        agendaText = extractPdfTextViaVps_(agendaPdf.url) || '';
+        Logger.log(`議事次第: ${agendaText.length}文字`);
+      }
+      if (rosterPdf) {
+        rosterText = extractPdfTextViaVps_(rosterPdf.url) || '';
+        Logger.log(`委員名簿: ${rosterText.length}文字`);
+      }
+      
+      // YouTube字幕
+      let transcript = '';
+      if (mt.youtube) {
+        const r = fetchSubsViaVps_(mt.youtube);
+        transcript = cleanTranscript_(r.text || '');
+        Logger.log(`字幕: ${transcript.length}文字`);
+      }
+      
+      if (!transcript || transcript.length < 1000) {
+        Logger.log('⚠️ 字幕なし - スキップ\n');
+        results.push({ id: tc.id, name: tc.name, status: 'no_transcript' });
+        continue;
+      }
+      
+      // 要約生成
+      Logger.log('🤖 要約生成中...');
+      const finalSummary = summarizeMeeting_(mt, agendaText, rosterText, transcript) || '';
+      Logger.log(`  生成: ${finalSummary.length}文字`);
+      
+      if (finalSummary.length < 500) {
+        Logger.log('⚠️ 要約失敗\n');
+        results.push({ id: tc.id, name: tc.name, status: 'failed' });
+        continue;
+      }
+      
+      // メール送信
+      const agendaSmart = extractAgendaSmartFromGijishidai_(agendaText || '');
+      const agendaBlock = agendaSmart.block || fallbackAgendaFromTitleOrPdfs_(mt) || '';
+      
+      const { subject, plain, htmlBody } = buildMailWithSummary_(
+        mt, 
+        finalSummary, 
+        buildLinksBlock_(mt, agendaPdf, rosterPdf), 
+        'ASR',
+        agendaBlock
+      );
+      
+      Logger.log('件名: ' + subject);
+      
+      const testEmail = 'toshihiro.higaki@klammer.co.jp';
+      sendToRecipients_([testEmail], subject, plain, htmlBody);
+      
+      Logger.log(`✅ 送信完了\n`);
+      results.push({ id: tc.id, name: tc.name, status: 'success', length: finalSummary.length });
+      
+      // 待機
+      if (i < testCases.length - 1) {
+        Logger.log('待機中...\n');
+        Utilities.sleep(10000);
+      }
+      
+    } catch (e) {
+      Logger.log(`❌ エラー: ${e.message}\n`);
+      results.push({ id: tc.id, name: tc.name, status: 'error', error: e.message });
+    }
+  }
+  
+  // サマリー
+  Logger.log('\n================================================================================');
+  Logger.log('📊 テスト結果サマリー');
+  Logger.log('================================================================================');
+  
+  results.forEach(r => {
+    const icon = r.status === 'success' ? '✅' : '❌';
+    const detail = r.status === 'success' ? `${r.length}文字` : r.status;
+    Logger.log(`${icon} [${r.id}] ${r.name}: ${detail}`);
+  });
+  
+  const successCount = results.filter(r => r.status === 'success').length;
+  Logger.log(`\n✅ 成功: ${successCount}/${results.length}会議`);
+  Logger.log('\n🎉 全テスト完了');
+}
+
+function testFetcherFixed() {
+  Logger.log('=== Fetcher復旧後テスト ===');
+  
+  const url = 'https://www.meti.go.jp/shingikai/enecho/denryoku_gas/saisei_kano/';
+  const html = fetchText_(url);
+  
+  if (html && html.length > 1000) {
+    Logger.log('✅ Fetcher完全復旧成功！');
+    Logger.log(`取得: ${html.length}文字`);
+  } else {
+    Logger.log('❌ 失敗');
+  }
 }
