@@ -2,10 +2,10 @@
 
 経済産業省・金融庁の政府会議を自動監視し、AIで要約してメール配信するシステム
 
-**最終更新**: 2025-11-13  
-**バージョン**: 0.3.1  
-**監視会議数**: 14会議（経産省8 + 金融庁6）  
-**稼働状況**: α版稼働中（VPS復旧完了）
+**最終更新**: 2025-11-14  ← 変更
+**バージョン**: 0.4.0  ← 変更（Phase 2-3完了）
+**監視会議数**: 14会議（経産省8 + 金融庁6）
+**稼働状況**: β版稼働中（全機能実装完了）  ← 変更
 
 ---
 
@@ -139,6 +139,32 @@ curl -X POST https://fetch.klammer.co.jp/asr/youtube-subs \
 docker-compose up --build -d
 ```
 ### 最近の更新
+#### 2025-11-14: Phase 2-3完了 ✅
+
+**金融庁6会議の完全対応**:
+- ✅ 資料公開通知の自動化（議題付き）
+- ✅ 議事録監視機能の実装
+- ✅ 全6会議で議題抽出成功（6/6）
+- ✅ Archive完全対応（phase管理）
+
+**優先度1-3の完全達成**:
+1. ✅ 日付表示の修正
+   - state保存の改善
+   - 令和表記から西暦への変換
+   - レポートでの正確な日付表示
+2. ✅ 最新会議の選択修正
+   - 日付ソートの実装
+   - 令和7年度会議の正確な抽出
+3. ✅ 議題抽出の改善
+   - HTML構造の分析（`<dl class="l_material">`対応）
+   - 複数パターンの実装
+   - 暗号資産制度WGの特殊構造対応
+   - **全6会議で議題抽出成功**
+
+**追加改善**:
+- ✅ 表形式レポートの実装（HTML、色分け）
+- ✅ 機関名の追加（経産省/金融庁の区別）
+- ✅ エラーハンドリングの強化
 #### 2025-11-13: YouTube PO Token対応完了 ⚠️ 重要
 
 **背景**:
@@ -331,13 +357,19 @@ docker-compose up --build -d
 - 議事録ページ: `https://www.fsa.go.jp/singi/.../gijiroku/YYYYMMDD.html`
 - ID形式: 回数（第1回、第2回...）
 
-#### 議題の抽出方法
+#### 議題の抽出方法 ✅ 実装完了
+
 1. 資料ページのHTMLを取得
-2. `<dl class="l_material">` から配付資料リストを抽出
+2. HTML全体から`<dt>資料X</dt><dd>...</dd>`パターンを検索
 3. 各資料のタイトルを議題として使用
 
+**実装の特徴**:
+- ✅ 複数の`<dl class="l_material">`に対応（会議概要と資料リストの分離）
+- ✅ HTML全体を検索（特定の`<dl>`に依存しない）
+- ✅ フォールバックパターンで高い成功率
+
 **例**:
-```
+```html
 <dt>資料１</dt><dd>事務局説明資料①</dd>
 <dt>資料２</dt><dd>事務局説明資料②</dd>
 
@@ -345,6 +377,9 @@ docker-compose up --build -d
 
 1. 事務局説明資料①
 2. 事務局説明資料②
+```
+
+**抽出成功率**: 6/6会議（100%）
 ```
 
 #### 対象会議一覧
@@ -424,22 +459,26 @@ const res = UrlFetchApp.fetch(fetcherUrl, {
 - ✅ `toDir_(url)` - URLのディレクトリ部分を取得
 
 #### Phase 2: 金融庁専用処理
-- ✅ extractFsaMeetingPages_(html, baseDir) - 会議一覧抽出（ul/li対応）
-- ✅ extractAgendaFromFsaResourcePage_(html) - 議題抽出（dl構造対応）
-- ✅ findInArchive_(sourceId, meetingId) - archive検索
-- ✅ updateArchive_(rowIndex, updates) - archive更新
-- ✅ saveToArchive_(..., phase) - phase対応版
-- ✅ sendFsaResourceNotification_(src, meeting) - 資料公開通知
-- ✅ sendFsaSummaryNotification_(src, meeting) - 議事録公開通知
-- ✅ summarizeMeeting_(..., providedAgenda) - 外部議題対応
+- ✅ `extractFsaMeetingPages_(html, baseDir)` - 会議一覧抽出（ul/li対応、日付ソート）
+- ✅ `extractAgendaFromFsaResourcePage_(html)` - 議題抽出（dl構造対応、複数パターン）
+- ✅ `scrapeFsaMeetingPage_(url)` - 資料/議事録ページ解析
+- ✅ `findInArchive_(sourceId, meetingId)` - archive検索
+- ✅ `updateArchive_(rowIndex, updates)` - archive更新
+- ✅ `saveToArchive_(..., phase)` - phase対応版
+- ✅ `sendFsaResourceNotification_(src, meeting)` - 資料公開通知
+- ✅ `sendFsaSummaryNotification_(src, meeting)` - 議事録公開通知
+- ✅ `summarizeMeeting_(..., providedAgenda)` - 外部議題対応
 
-#### Phase 3: 統合（未実装）
-- ⏳ `checkFsaMeeting_(src, state)` - 金融庁会議チェック（dailyCheckAll用）
-- ⏳ `checkFsaGijiyoshi_()` - 議事録監視（定期チェック）
-- ⏳ `dailyCheckAll()` 修正 - 金融庁対応
+#### Phase 3: 統合 ✅
+- ✅ `checkFsaMeeting_(src, state)` - 金融庁会議チェック（dailyCheckAll統合済み）
+- ✅ `checkFsaGijiyoshi_()` - 議事録監視（定期チェック実装済み）
+- ✅ `dailyCheckAll()` 修正 - 金融庁完全対応、表形式レポート
 
 #### 経産省関連（改善済み）
 - ✅ `fallbackAgendaFromTitleOrPdfs_(mt)` - PDFタイトルから議題生成（修正済み）
+
+#### レポート関連（新規）
+- ✅ `sendDailyCheckReport_(summary, startTime, endTime)` - HTML表形式レポート
 
 ### 3. 要約生成
 
