@@ -137,7 +137,7 @@ curl -X POST https://fetch.klammer.co.jp/asr/youtube-subs \
 # 4. 問題なければ requirements.txt 更新
 # 5. 再ビルド
 docker-compose up --build -d
-
+```
 ### 最近の更新
 #### 2025-11-13: YouTube PO Token対応完了 ⚠️ 重要
 
