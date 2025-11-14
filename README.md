@@ -72,11 +72,11 @@ Webページ    YouTube字幕
 7. Archiveに保存（phase='summary'）
 ```
 
-#### 金融庁会議（新）
+#### 金融庁会議
 ```
 【フェーズ1: 資料公開時】
 1. 会議ページ検知（dailyCheckAll）
-2. 資料ページから議題抽出（HTML配付資料リスト）
+2. 資料ページから議題抽出（HTML <dl> 構造）
 3. 配布資料リンクを含めて通知
 4. Archiveに保存（phase='resources'）
 
@@ -258,16 +258,22 @@ docker-compose up --build -d
 ```
 会議トップページ (XXX_index.html)
 ├─ 第5回 2025年11月7日
-│  ├─ 開催通知 (kaisai/)
+│  ├─ 開催通知 (news/r7/singi/20251031.html)
 │  ├─ 資料ページ (gijishidai/20251107.html) ← 当日公開
 │  └─ 議事録ページ (gijiroku/20251107.html) ← 1-2ヶ月後（未公開の場合あり）
-└─ 第4回 2025年10月22日
+├─ 第4回 2025年10月22日
+│  ├─ 開催通知
+│  ├─ 資料ページ
+│  └─ （議事録未公開）
+└─ 第3回 2025年9月29日
    ├─ 開催通知
    ├─ 資料ページ
-   └─ 議事録ページ
+   └─ 議事録ページ ← 公開済み
 ```
 
-**HTML構造**:
+#### HTML構造の特徴
+
+**会議一覧（トップページ）**:
 ```html
 <ul class="fsc_list no_icon">
   <li><p>第５回 令和７年11月７日（金曜）</p>
@@ -287,16 +293,59 @@ docker-compose up --build -d
 </ul>
 ```
 
-**資料ページの特徴**:
+**重要**: 
+- ❌ `<table><tr>` 構造ではない
+- ✅ `<ul><li>` 構造を使用
+- ✅ 議事録リンクは公開後に追加される
+
+---
+
+**配付資料（資料ページ）**:
+```html
+<h2>配付資料</h2>
+<dl class="l_material char3 mt20">
+  <dt>資料１</dt>
+  <dd>
+    <img alt="PDF" class="pdf" src="...">
+    <a href="...">事務局説明資料①</a>
+  </dd>
+  <dt>資料２</dt>
+  <dd>
+    <img alt="PDF" class="pdf" src="...">
+    <a href="...">事務局説明資料②</a>
+  </dd>
+</dl>
+```
+
+**重要**: 
 - ❌ 「議題」という見出しは**存在しない**
-- ✅ 「配付資料」リストから議題を推測
-- 例: `資料1 ステーブルコインの規制について.pdf` → `1. ステーブルコインの規制について`
+- ❌ `<ol>` や `<ul>` ではない
+- ✅ `<dl>` (Definition List) を使用
+- ✅ 配付資料リストから議題を推測
+
+---
 
 #### URL形式
 - インデックス: `https://www.fsa.go.jp/singi/.../XXX_index.html`
 - 資料ページ: `https://www.fsa.go.jp/singi/.../gijishidai/YYYYMMDD.html`
 - 議事録ページ: `https://www.fsa.go.jp/singi/.../gijiroku/YYYYMMDD.html`
-- ID形式: 日付（YYYYMMDD形式）
+- ID形式: 回数（第1回、第2回...）
+
+#### 議題の抽出方法
+1. 資料ページのHTMLを取得
+2. `<dl class="l_material">` から配付資料リストを抽出
+3. 各資料のタイトルを議題として使用
+
+**例**:
+```
+<dt>資料１</dt><dd>事務局説明資料①</dd>
+<dt>資料２</dt><dd>事務局説明資料②</dd>
+
+↓ 抽出結果
+
+1. 事務局説明資料①
+2. 事務局説明資料②
+```
 
 #### 対象会議一覧
 9. AI官民フォーラム
@@ -305,7 +354,6 @@ docker-compose up --build -d
 12. 市場制度ワーキング・グループ
 13. ディスクロージャーワーキング・グループ
 14. コーポレートガバナンス・コードの改訂に関する有識者会議
-
 ---
 
 ## 🔧 主要コンポーネント
@@ -376,8 +424,8 @@ const res = UrlFetchApp.fetch(fetcherUrl, {
 - ✅ `toDir_(url)` - URLのディレクトリ部分を取得
 
 #### Phase 2: 金融庁専用処理
-- ✅ `extractFsaMeetingPages_(html, baseDir)` - 会議一覧抽出（ul/li構造対応）
-- 🔄 `extractAgendaFromFsaResourcePage_(html)` - 議題抽出（配付資料から推測、調整中）
+- ✅ `extractFsaMeetingPages_(html, baseDir)` - 会議一覧抽出（`<ul><li>` 構造対応）
+- ✅ `extractAgendaFromFsaResourcePage_(html)` - 議題抽出（`<dl>` 構造から配付資料を抽出）
 - ✅ `findInArchive_(sourceId, meetingId)` - archive検索
 - ✅ `updateArchive_(rowIndex, updates)` - archive更新
 - ✅ `saveToArchive_(..., phase)` - phase対応版に拡張
