@@ -59,6 +59,34 @@ Webページ    YouTube字幕
 │   - gemini-2.5-flash (要約生成)      │
 └─────────────────────────────────────┘
 ```
+### システムフロー（省庁別）
+
+#### 経産省会議
+```
+1. 会議ページ検知（dailyCheckAll）
+2. YouTube字幕取得（VPS/yt-dlp）
+3. 議事次第PDF取得（VPS/OCR）
+4. 議題抽出（PDF OCR → フォールバック）
+5. Gemini APIで要約生成
+6. メール配信（即時）
+7. Archiveに保存（phase='summary'）
+```
+
+#### 金融庁会議（新）
+```
+【フェーズ1: 資料公開時】
+1. 会議ページ検知（dailyCheckAll）
+2. 資料ページから議題抽出（HTML配付資料リスト）
+3. 配布資料リンクを含めて通知
+4. Archiveに保存（phase='resources'）
+
+【フェーズ2: 議事録公開時（1-2ヶ月後）】
+1. 議事録URLの公開を検知（定期チェック）
+2. 議事録HTML取得
+3. Gemini APIで要約生成
+4. メール配信（要約あり）
+5. Archiveを更新（phase='summary'）
+```
 
 ### 技術スタック
 - **GAS**: メインロジック、メール配信
@@ -229,14 +257,45 @@ docker-compose up --build -d
 #### 会議の構造
 ```
 会議トップページ (XXX_index.html)
-├─ 開催通知 (kaisai/)
-├─ 資料ページ (siryou/shiryou/gijishidai/) ← 当日公開
-└─ 議事要旨ページ (gijiyoshi/gijiroku/)    ← 1-2ヶ月後
+├─ 第5回 2025年11月7日
+│  ├─ 開催通知 (kaisai/)
+│  ├─ 資料ページ (gijishidai/20251107.html) ← 当日公開
+│  └─ 議事録ページ (gijiroku/20251107.html) ← 1-2ヶ月後（未公開の場合あり）
+└─ 第4回 2025年10月22日
+   ├─ 開催通知
+   ├─ 資料ページ
+   └─ 議事録ページ
 ```
+
+**HTML構造**:
+```html
+<ul class="fsc_list no_icon">
+  <li><p>第５回 令和７年11月７日（金曜）</p>
+   <ul>
+    <li><a href="/news/...">開催通知</a></li>
+    <li><a href="/singi/.../gijishidai/20251107.html">資料</a></li>
+    <!-- 議事録は公開後に追加 -->
+   </ul>
+  </li>
+  <li><p>第３回 令和７年９月29日（月曜）</p>
+   <ul>
+    <li><a href="/news/...">開催通知</a></li>
+    <li><a href="/singi/.../gijishidai/20250929.html">資料</a></li>
+    <li><a href="/singi/.../gijiroku/20250929.html">議事録</a></li>
+   </ul>
+  </li>
+</ul>
+```
+
+**資料ページの特徴**:
+- ❌ 「議題」という見出しは**存在しない**
+- ✅ 「配付資料」リストから議題を推測
+- 例: `資料1 ステーブルコインの規制について.pdf` → `1. ステーブルコインの規制について`
 
 #### URL形式
 - インデックス: `https://www.fsa.go.jp/singi/.../XXX_index.html`
-- 資料ページ: `https://www.fsa.go.jp/singi/.../siryou/YYYYMMDD.html`
+- 資料ページ: `https://www.fsa.go.jp/singi/.../gijishidai/YYYYMMDD.html`
+- 議事録ページ: `https://www.fsa.go.jp/singi/.../gijiroku/YYYYMMDD.html`
 - ID形式: 日付（YYYYMMDD形式）
 
 #### 対象会議一覧
@@ -309,6 +368,30 @@ const res = UrlFetchApp.fetch(fetcherUrl, {
 - yt-dlp で字幕取得
 - 自動生成字幕対応
 
+### 3. 実装済み関数一覧
+
+#### Phase 1: 基盤整備
+- ✅ `upgradeArchiveSheet()` - archiveシート拡張（新列追加）
+- ✅ `toAbsUrl_(url, baseUrl)` - 相対URL → 絶対URL変換
+- ✅ `toDir_(url)` - URLのディレクトリ部分を取得
+
+#### Phase 2: 金融庁専用処理
+- ✅ `extractFsaMeetingPages_(html, baseDir)` - 会議一覧抽出（ul/li構造対応）
+- 🔄 `extractAgendaFromFsaResourcePage_(html)` - 議題抽出（配付資料から推測、調整中）
+- ✅ `findInArchive_(sourceId, meetingId)` - archive検索
+- ✅ `updateArchive_(rowIndex, updates)` - archive更新
+- ✅ `saveToArchive_(..., phase)` - phase対応版に拡張
+- ✅ `sendFsaResourceNotification_(src, meeting)` - 資料公開通知
+- ✅ `sendFsaSummaryNotification_(src, meeting)` - 議事録公開通知
+
+#### Phase 3: 統合（未実装）
+- ⏳ `checkFsaMeeting_(src, state)` - 金融庁会議チェック（dailyCheckAll用）
+- ⏳ `checkFsaGijiyoshi_()` - 議事録監視（定期チェック）
+- ⏳ `dailyCheckAll()` 修正 - 金融庁対応
+
+#### 経産省関連（改善済み）
+- ✅ `fallbackAgendaFromTitleOrPdfs_(mt)` - PDFタイトルから議題生成（修正済み）
+
 ### 3. 要約生成
 
 #### Gemini API設定
@@ -365,11 +448,41 @@ maxOutputTokens: 4096
 }
 ```
 
-#### archive シート
-| timestamp | sourceId | meetingId | title | sentTo | status |
-|-----------|----------|-----------|-------|--------|--------|
-| 2025-11-13 10:00 | 1 | 20 | 第20回... | 5 | sent |
+#### archive シート（拡張版）
 
+| 列名 | 説明 | 例 |
+|------|------|-----|
+| id | 連番 | 1 |
+| sourceId | ソースID | 10 |
+| sourceName | 会議名 | 暗号資産制度WG |
+| agency | 省庁 | 金融庁 |
+| meetingId | 会議回数 | 5 |
+| meetingDate | 開催日 | 2025-11-07 |
+| title | 会議タイトル | 金融審議会「暗号資産制度...」 |
+| url | 会議URL | https://... |
+| youtube | YouTubeURL | https://... |
+| agendaPdfUrl | 議事次第PDF | https://... |
+| rosterPdfUrl | 委員名簿PDF | https://... |
+| summary | 要約 | ・ステーブルコイン... |
+| summaryLen | 要約文字数 | 2500 |
+| sourceTag | ソース種別 | YouTube字幕 / 議事録HTML |
+| timestamp | 処理日時 | 2025-11-13T10:00:00Z |
+| **phase** | **通知フェーズ** | **resources / summary** |
+| **resourcesSentAt** | **資料公開通知日時** | **2025-11-13T10:00:00Z** |
+| **summarySentAt** | **議事録公開通知日時** | **2025-12-20T09:00:00Z** |
+| **gijirokuUrl** | **議事録URL** | **https://...** |
+
+**phase の値**:
+- `resources`: 資料公開通知済み、議事録未公開（金融庁のみ）
+- `summary`: 議事録公開通知済み（経産省・金融庁共通）
+
+**使用例**:
+```javascript
+// 資料公開時
+saveToArchive_(..., 'resources');  // phase='resources'
+
+// 議事録公開時
+updateArchive_(rowIndex, { phase: 'summary', summarySentAt: new Date() });
 ---
 
 ## 🔒 セキュリティ
@@ -762,7 +875,68 @@ sudo tail -f /var/log/nginx/access.log
 # fail2banログ
 sudo tail -f /var/log/fail2ban.log
 ```
+## 🐛 既知の問題
 
+### 1. VPS側のPDF OCR精度が低い（優先度: 低）
+
+**問題**: 議事次第PDFから300文字しか取得できない
+
+**影響**: 
+- 議事次第PDFから議題を抽出できない場合がある
+- 経産省: フォールバック（PDFタイトルから生成）で回避済み
+- 金融庁: 配付資料リストから推測（実装中）
+
+**根本原因**: 
+- app.pyがPyMuPDFを使わず、すべてOCR処理
+
+**対応案**:
+```python
+# /root/asr/app.py の extract_text_from_pdf() を修正
+def extract_text_from_pdf(pdf_path):
+    import fitz  # PyMuPDF
+    
+    # 1. PyMuPDFで直接テキスト抽出
+    doc = fitz.open(pdf_path)
+    text = "\n".join([page.get_text() for page in doc])
+    
+    # 2. テキストが少ない場合のみOCRにフォールバック
+    if len(text.strip()) < 100:
+        # OCR処理
+        ...
+    
+    return text
+```
+
+**注**: 現在はフォールバックで動作しているため緊急性は低い
+
+---
+
+### 2. 金融庁会議の議題抽出（進行中）
+
+**問題**: 資料ページに「議題」という見出しが存在しない
+
+**対応**:
+- 配付資料リストから議題を推測する実装を調整中
+- 例: `資料1 ステーブルコインの規制について.pdf` → `1. ステーブルコインの規制について`
+
+**状況**: 
+- ✅ 会議ページ抽出完了
+- 🔄 議題抽出関数の調整中
+- ⏳ 統合待ち
+
+---
+
+### 3. 金融庁の議事録監視機能（未実装）
+
+**問題**: 議事録公開を自動検知する機能がない
+
+**影響**: 
+- 現在は資料公開時のみ通知
+- 議事録公開時の要約配信は手動
+
+**対応予定**:
+- 定期チェック機能の実装（Phase 3）
+- archiveのphase='resources'の会議について議事録URLを監視
 ---
 
 ## 📊 監視・メトリクス
