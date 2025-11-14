@@ -424,13 +424,14 @@ const res = UrlFetchApp.fetch(fetcherUrl, {
 - ✅ `toDir_(url)` - URLのディレクトリ部分を取得
 
 #### Phase 2: 金融庁専用処理
-- ✅ `extractFsaMeetingPages_(html, baseDir)` - 会議一覧抽出（`<ul><li>` 構造対応）
-- ✅ `extractAgendaFromFsaResourcePage_(html)` - 議題抽出（`<dl>` 構造から配付資料を抽出）
-- ✅ `findInArchive_(sourceId, meetingId)` - archive検索
-- ✅ `updateArchive_(rowIndex, updates)` - archive更新
-- ✅ `saveToArchive_(..., phase)` - phase対応版に拡張
-- ✅ `sendFsaResourceNotification_(src, meeting)` - 資料公開通知
-- ✅ `sendFsaSummaryNotification_(src, meeting)` - 議事録公開通知
+- ✅ extractFsaMeetingPages_(html, baseDir) - 会議一覧抽出（ul/li対応）
+- ✅ extractAgendaFromFsaResourcePage_(html) - 議題抽出（dl構造対応）
+- ✅ findInArchive_(sourceId, meetingId) - archive検索
+- ✅ updateArchive_(rowIndex, updates) - archive更新
+- ✅ saveToArchive_(..., phase) - phase対応版
+- ✅ sendFsaResourceNotification_(src, meeting) - 資料公開通知
+- ✅ sendFsaSummaryNotification_(src, meeting) - 議事録公開通知
+- ✅ summarizeMeeting_(..., providedAgenda) - 外部議題対応
 
 #### Phase 3: 統合（未実装）
 - ⏳ `checkFsaMeeting_(src, state)` - 金融庁会議チェック（dailyCheckAll用）
