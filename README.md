@@ -2,11 +2,10 @@
 
 経済産業省・金融庁の政府会議を自動監視し、AIで要約してメール配信するシステム
 
-**最終更新**: 2025-11-16  ← 変更
-**バージョン**: 0.5.0  ← 変更（会議管理システム実装）
-**監視会議数**: 18会議（経産省12 + 金融庁6）  ← 変更
-**稼働状況**: β版稼働中（会議管理システム実装済み）  ← 変更
-
+**最終更新**: 2025-11-17  ← 変更
+**バージョン**: 0.6.0  ← 変更
+**監視会議数**: 18会議（経産省12 + 金融庁6）
+**稼働状況**: β版稼働中（購読管理システム実装済み）  ← 変更
 ---
 
 ## 📊 システム概要
@@ -139,6 +138,21 @@ curl -X POST https://fetch.klammer.co.jp/asr/youtube-subs \
 docker-compose up --build -d
 ```
 ### 最近の更新
+#### 2025-11-17: 購読管理システム実装 ✅
+- ✅ 購読者へのメール送信機能の修正
+  - `getRecipientsForSource_`関数の修正（ID対応）
+  - 購読者取得ロジックの改善
+- ✅ archiveシート構造の修正
+  - `sent_at`列の削除
+  - phase列の命名改善提案（`awaiting_minutes` / `completed`）
+  - `gijirokuUrl`の正しい保存実装
+- ✅ 議事録監視機能の動作確認
+  - `checkFsaGijiyoshi_`関数の動作確認
+  - phase='awaiting_minutes'会議の自動検知テスト
+- 🔧 VPS側PDF取得エラーの診断（未解決）
+  - HTTP 401エラーの継続
+  - ヘッダー追加による修正を試行中
+
 #### 2025-11-16: 会議管理システム実装 ✅
 - ✅ 複合ID形式（METI_001形式）への移行
 - ✅ meeting-manager.gs による会議追加・管理の自動化
@@ -549,6 +563,26 @@ maxOutputTokens: 4096
   }
 }
 ```
+### 6. 購読管理システム
+
+#### 購読者取得ロジック
+```javascript
+function getRecipientsForSource_(sourceIdOrName) {
+  // ID形式（METI_002）または会議名で検索
+  // ID形式の場合は正規化せず直接比較
+  // 会議名の場合は正規化して比較
+}
+```
+
+#### recipientsシート構造
+| email | status | sources | token | created_at | updated_at | note |
+|-------|--------|---------|-------|------------|------------|------|
+| user@example.com | active | METI_001,METI_002 | xxx | ... | ... | |
+
+- `status`: active / unsubscribed
+- `sources`: 購読会議ID（カンマ区切り）または `*`（全会議）
+- `token`: 配信停止用トークン
+
 
 #### archive シート（拡張版）
 
@@ -569,22 +603,21 @@ maxOutputTokens: 4096
 | summaryLen | 要約文字数 | 2500 |
 | sourceTag | ソース種別 | YouTube字幕 / 議事録HTML |
 | timestamp | 処理日時 | 2025-11-13T10:00:00Z |
-| **phase** | **通知フェーズ** | **resources / summary** |
+
+| ... | ... | ... |
+| **phase** | **通知フェーズ** | **awaiting_minutes / completed** |  ← 変更
 | **resourcesSentAt** | **資料公開通知日時** | **2025-11-13T10:00:00Z** |
-| **summarySentAt** | **議事録公開通知日時** | **2025-12-20T09:00:00Z** |
+| **summarySentAt** | **要約送信日時** | **2025-12-20T09:00:00Z** |  ← 変更
 | **gijirokuUrl** | **議事録URL** | **https://...** |
 
 **phase の値**:
-- `resources`: 資料公開通知済み、議事録未公開（金融庁のみ）
-- `summary`: 議事録公開通知済み（経産省・金融庁共通）
+- `awaiting_minutes`: 資料公開通知済み、議事録未公開（金融庁のみ）  ← 変更
+- `completed`: 要約送信済み（経産省・金融庁共通）  ← 変更
 
-**使用例**:
-```javascript
-// 資料公開時
-saveToArchive_(..., 'resources');  // phase='resources'
-
-// 議事録公開時
-updateArchive_(rowIndex, { phase: 'summary', summarySentAt: new Date() });
+**phase命名の意図**:
+- `awaiting_minutes` = 議事録（minutes）待ち状態
+- `completed` = 処理完了状態
+- 旧名称（`resources`/`summary`）から変更予定
 ---
 
 ## 🔒 セキュリティ
